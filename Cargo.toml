@@ -1,0 +1,45 @@
+[package]
+name = "transcribe"
+version = "0.1.0"
+edition = "2024"
+default-run = "transcribe-gui"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.5", features = ["derive"] }
+cpal = "0.18.1"
+eframe = "0.35.0"
+egui-phosphor = "0.13"
+ndarray = "0.16"
+# pinned to the ort version pyannote-rs 0.3.4 compiles against
+ort = { version = "=2.0.0-rc.10", features = ["ndarray"] }
+pyannote-rs = "0.3.4"
+rfd = "0.17.2"
+rubato = "4.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+symphonia = { version = "0.6.0", features = ["aac", "isomp4", "mp3"] }
+ureq = "3.3.0"
+# Metal GPU acceleration exists only on Apple platforms; other targets
+# build whisper.cpp for CPU.
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16.0", features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+whisper-rs = "0.16.0"
+
+# Local copy of ort-sys with its binary-download build dependency switched
+# from native-tls (openssl) to rustls, keeping the build openssl-free.
+[patch.crates-io]
+ort-sys = { path = "vendor/ort-sys" }
+
+[profile.release]
+lto = "thin"
+
+# `./bundle.sh` builds Transcribe.app from the GUI binary (see README)
+[package.metadata.bundle.bin.transcribe-gui]
+name = "Transcribe"
+identifier = "com.woelper.transcribe"
+icon = ["assets/icon.icns"]
+category = "public.app-category.productivity"
+short_description = "Local Whisper transcription with speaker detection"

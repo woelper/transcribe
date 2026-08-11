@@ -1,0 +1,1208 @@
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use eframe::egui;
+use egui_phosphor::regular::{
+    ARROWS_CLOCKWISE, BOOK_OPEN, CHECK, DOWNLOAD_SIMPLE, FLOPPY_DISK, FOLDER_OPEN, MICROPHONE,
+    NOTE_PENCIL, RECORD, STOP, TRASH, USERS, WARNING,
+};
+use transcribe::diarize::SpeakerProfile;
+use transcribe::download::{WHISPER_MODELS, model_by_name};
+use transcribe::recorder::{self, Recorder};
+use transcribe::{DiarizeModels, Options, Progress, SpeakerVoice, Transcript};
+
+const DEFAULT_MODEL: &str = "large-v3-turbo";
+
+const MIC_PLIST_ERROR: &str = "error: this app bundle was built without microphone access \
+    (missing NSMicrophoneUsageDescription) — macOS would kill it when recording starts. \
+    Rebuild the bundle with ./bundle.sh instead of `cargo bundle`";
+
+fn main() -> eframe::Result {
+    // Same icon as the .app bundle; on macOS eframe applies it to the
+    // Dock, so the binary looks right even when run outside the bundle.
+    let icon = egui::IconData {
+        rgba: include_bytes!("../../assets/icon-256.rgba").to_vec(),
+        width: 256,
+        height: 256,
+    };
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([860.0, 640.0])
+            .with_icon(icon),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "transcribe",
+        options,
+        Box::new(|cc| {
+            setup_theme(&cc.egui_ctx);
+            Ok(Box::new(App::new()))
+        }),
+    )
+}
+
+/// IBM Plex typography, a soft light palette, and roomy rounded
+/// borderless buttons.
+fn setup_theme(ctx: &egui::Context) {
+    use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle, vec2};
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "plex-sans".into(),
+        egui::FontData::from_static(include_bytes!("../../assets/fonts/IBMPlexSans-Regular.ttf"))
+            .into(),
+    );
+    fonts.font_data.insert(
+        "plex-sans-medium".into(),
+        egui::FontData::from_static(include_bytes!("../../assets/fonts/IBMPlexSans-Medium.ttf"))
+            .into(),
+    );
+    fonts.font_data.insert(
+        "plex-mono".into(),
+        egui::FontData::from_static(include_bytes!("../../assets/fonts/IBMPlexMono-Regular.ttf"))
+            .into(),
+    );
+    fonts
+        .families
+        .get_mut(&FontFamily::Proportional)
+        .unwrap()
+        .insert(0, "plex-sans".into());
+    fonts
+        .families
+        .get_mut(&FontFamily::Monospace)
+        .unwrap()
+        .insert(0, "plex-mono".into());
+    fonts.families.insert(
+        FontFamily::Name("plex-medium".into()),
+        vec!["plex-sans-medium".into(), "plex-sans".into()],
+    );
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
+
+    ctx.set_theme(egui::ThemePreference::Light);
+    let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
+    style.text_styles = [
+        (TextStyle::Heading, FontId::new(18.0, FontFamily::Name("plex-medium".into()))),
+        (TextStyle::Body, FontId::new(14.5, FontFamily::Proportional)),
+        (TextStyle::Button, FontId::new(14.5, FontFamily::Proportional)),
+        (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+        (TextStyle::Small, FontId::new(11.5, FontFamily::Proportional)),
+    ]
+    .into();
+    style.spacing.item_spacing = vec2(10.0, 10.0);
+    style.spacing.button_padding = vec2(14.0, 7.0);
+    style.spacing.interact_size = vec2(40.0, 32.0);
+
+    let text = Color32::from_rgb(0x30, 0x34, 0x3c);
+    let accent = Color32::from_rgb(0x11, 0x72, 0xdc);
+    let button = Color32::from_rgb(0xe9, 0xed, 0xf3);
+    let button_hover = Color32::from_rgb(0xdd, 0xe4, 0xee);
+    let button_press = Color32::from_rgb(0xc4, 0xe1, 0xfb);
+
+    let mut v = egui::Visuals::light();
+    v.override_text_color = Some(text);
+    v.panel_fill = Color32::from_rgb(0xf7, 0xf8, 0xfb);
+    v.window_fill = Color32::from_rgb(0xf7, 0xf8, 0xfb);
+    v.extreme_bg_color = Color32::WHITE; // text-edit backgrounds
+    v.faint_bg_color = Color32::from_rgb(0xee, 0xf1, 0xf6);
+    v.selection.bg_fill = button_press;
+    v.selection.stroke = Stroke::new(1.0, accent);
+    v.hyperlink_color = accent;
+    v.window_corner_radius = CornerRadius::same(12);
+    for w in [
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.corner_radius = CornerRadius::same(10);
+        w.bg_stroke = Stroke::NONE;
+        w.expansion = 0.0;
+    }
+    v.widgets.noninteractive.corner_radius = CornerRadius::same(10);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xdf, 0xe3, 0xea));
+    v.widgets.inactive.weak_bg_fill = button;
+    v.widgets.inactive.bg_fill = button;
+    v.widgets.hovered.weak_bg_fill = button_hover;
+    v.widgets.hovered.bg_fill = button_hover;
+    v.widgets.active.weak_bg_fill = button_press;
+    v.widgets.active.bg_fill = button_press;
+    v.widgets.open.weak_bg_fill = button_hover;
+    v.widgets.open.bg_fill = button_hover;
+    style.visuals = v;
+    ctx.set_style_of(egui::Theme::Light, style);
+}
+
+/// What gets transcribed: a loaded file or an in-memory recording.
+enum Source {
+    File(PathBuf),
+    Recording { samples: Arc<Vec<f32>>, secs: f64 },
+}
+
+impl Source {
+    fn label(&self) -> String {
+        match self {
+            Source::File(path) => path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+            Source::Recording { secs, .. } => format!("recording ({})", format_mmss(*secs)),
+        }
+    }
+}
+
+/// State written by the worker thread and read by the UI each frame.
+#[derive(Default)]
+struct Job {
+    status: String,
+    percent: Option<i32>,
+    /// When whisper started decoding — basis for the ETA.
+    transcribe_started: Option<std::time::Instant>,
+    /// Segments streamed while whisper is still decoding; replaced by the
+    /// authoritative formatted transcript when the job finishes.
+    live: String,
+    result: Option<anyhow::Result<Transcript>>,
+}
+
+/// State of a model download running in a background thread.
+struct Download {
+    model: String,
+    started: std::time::Instant,
+    done: u64,
+    total: Option<u64>,
+    result: Option<anyhow::Result<()>>,
+}
+
+struct App {
+    source: Option<Source>,
+    devices: Vec<String>,
+    device: Option<String>, // None = system default input
+    recorder: Option<Recorder>,
+    diarize: bool,
+    timestamps: bool,
+    transcript: String,
+    status: String,
+    job: Option<Arc<Mutex<Job>>>,
+    // Resolved at startup: a bundled .app launches with cwd = "/",
+    // so relative model paths would not work there.
+    models_dir: Option<PathBuf>,
+    vocabulary: String,
+    vocabulary_path: PathBuf,
+    show_vocabulary: bool,
+    /// Free-form notes about the current recording (meeting name, speakers,
+    /// topics) — folded into the whisper prompt for this transcription only.
+    context: String,
+    model: String,
+    download: Option<Arc<Mutex<Download>>>,
+    show_speakers: bool,
+    /// How many people are in the recording (None = automatic, up to 8).
+    /// Junk clusters fold into the real speakers when this is set right.
+    max_speakers: Option<usize>,
+    profiles: Vec<SpeakerProfile>,
+    speakers_path: PathBuf,
+    enroll_name: String,
+    enroll_recorder: Option<Recorder>,
+    enroll_from: String,
+    enroll_to: String,
+    enroll_job: Option<Arc<Mutex<Enroll>>>,
+    /// Speakers of the last finished transcript, for post-hoc renaming.
+    speaker_voices: Vec<SpeakerVoice>,
+    rename_inputs: Vec<String>,
+    show_rename: bool,
+    enroll_on_rename: bool,
+}
+
+/// A file-based enrollment running in a background thread (decoding and
+/// VAD over a long recording can take a while).
+struct Enroll {
+    name: String,
+    result: Option<anyhow::Result<Vec<f32>>>,
+}
+
+impl App {
+    fn new() -> Self {
+        // Fall back to the per-user directory so a released app that lives
+        // outside the repo can still download models into a known place.
+        let models_dir = transcribe::find_models_dir().or_else(transcribe::default_models_dir);
+        let vocabulary_path = transcribe::vocabulary_path();
+        let speakers_path = transcribe::speakers_path();
+        let profiles = transcribe::load_speaker_profiles(&speakers_path).unwrap_or_default();
+        let status = match &models_dir {
+            None => "error: models/ directory not found — run the download \
+                scripts and keep the app inside the repo (or put a models/ \
+                folder next to it)"
+                .into(),
+            Some(dir) if !dir.join(model_by_name(DEFAULT_MODEL).unwrap().file).exists() => {
+                "no speech model downloaded yet — pick one from the model dropdown".into()
+            }
+            Some(_) => String::new(),
+        };
+        Self {
+            source: None,
+            devices: recorder::input_devices(),
+            device: None,
+            recorder: None,
+            diarize: false,
+            timestamps: false,
+            transcript: String::new(),
+            status,
+            job: None,
+            models_dir,
+            vocabulary: std::fs::read_to_string(&vocabulary_path).unwrap_or_default(),
+            vocabulary_path,
+            show_vocabulary: false,
+            context: String::new(),
+            model: DEFAULT_MODEL.into(),
+            download: None,
+            show_speakers: false,
+            max_speakers: None,
+            profiles,
+            speakers_path,
+            enroll_name: String::new(),
+            enroll_recorder: None,
+            enroll_from: String::new(),
+            enroll_to: String::new(),
+            enroll_job: None,
+            speaker_voices: Vec::new(),
+            rename_inputs: Vec::new(),
+            show_rename: false,
+            enroll_on_rename: true,
+        }
+    }
+
+    /// Enroll from an existing audio file, optionally restricted to a
+    /// time range where only this person speaks.
+    fn start_file_enrollment(&mut self, path: PathBuf) {
+        let Some(dir) = self.models_dir.clone() else {
+            self.status = "error: models/ directory not found".into();
+            return;
+        };
+        let from = match parse_time(&self.enroll_from) {
+            Err(input) => {
+                self.status = format!("error: can't parse start time \"{input}\" — use mm:ss");
+                return;
+            }
+            Ok(t) => t,
+        };
+        let to = match parse_time(&self.enroll_to) {
+            Err(input) => {
+                self.status = format!("error: can't parse end time \"{input}\" — use mm:ss");
+                return;
+            }
+            Ok(t) => t,
+        };
+
+        let job = Arc::new(Mutex::new(Enroll {
+            name: self.enroll_name.trim().to_owned(),
+            result: None,
+        }));
+        self.enroll_job = Some(job.clone());
+        std::thread::spawn(move || {
+            let result = (|| {
+                let samples = transcribe::decode_to_mono_16k(&path)?;
+                let rate = 16_000f64;
+                let lo = (from.unwrap_or(0.0) * rate) as usize;
+                let hi = to.map_or(samples.len(), |t| (t * rate) as usize).min(samples.len());
+                anyhow::ensure!(lo < hi, "the time range contains no audio");
+                transcribe::diarize::voice_embedding(
+                    &samples[lo..hi],
+                    16_000,
+                    &dir.join("segmentation-3.0.onnx"),
+                    &dir.join("wespeaker_en_voxceleb_CAM++.onnx"),
+                )
+            })();
+            job.lock().unwrap().result = Some(result);
+        });
+    }
+
+    /// Collect a finished file enrollment; returns whether one is running.
+    fn poll_enrollment(&mut self) -> bool {
+        let Some(job) = self.enroll_job.clone() else {
+            return false;
+        };
+        let mut job = job.lock().unwrap();
+        match job.result.take() {
+            Some(Ok(embedding)) => {
+                self.profiles.retain(|p| p.name != job.name);
+                self.profiles.push(SpeakerProfile {
+                    name: job.name.clone(),
+                    embedding,
+                });
+                match transcribe::save_speaker_profiles(&self.speakers_path, &self.profiles) {
+                    Ok(()) => {
+                        self.status = format!("enrolled {}", job.name);
+                        self.enroll_name.clear();
+                        self.enroll_from.clear();
+                        self.enroll_to.clear();
+                    }
+                    Err(e) => self.status = format!("error: {e:#}"),
+                }
+                self.enroll_job = None;
+                false
+            }
+            Some(Err(e)) => {
+                self.status = format!("error: enrollment failed: {e:#}");
+                self.enroll_job = None;
+                false
+            }
+            None => true,
+        }
+    }
+
+    fn model_path(&self) -> Option<PathBuf> {
+        let model = model_by_name(&self.model)?;
+        self.models_dir.as_ref().map(|dir| dir.join(model.file))
+    }
+
+    /// Fetch the selected model in the background if it isn't on disk yet.
+    fn start_download_if_missing(&mut self) {
+        let Some(path) = self.model_path() else { return };
+        let Some(model) = model_by_name(&self.model) else { return };
+        if path.exists() || self.download.is_some() {
+            return;
+        }
+        let download = Arc::new(Mutex::new(Download {
+            model: self.model.clone(),
+            started: std::time::Instant::now(),
+            done: 0,
+            total: None,
+            result: None,
+        }));
+        self.download = Some(download.clone());
+        let url = model.url.to_owned();
+        std::thread::spawn(move || {
+            let progress = {
+                let download = download.clone();
+                move |done, total| {
+                    let mut download = download.lock().unwrap();
+                    download.done = done;
+                    download.total = total;
+                }
+            };
+            let result = transcribe::download::download(&url, &path, progress);
+            download.lock().unwrap().result = Some(result);
+        });
+    }
+
+    /// Collect download updates; returns the in-flight progress, if any.
+    fn poll_download(&mut self) -> Option<(String, Option<f32>, Option<String>)> {
+        let download = self.download.clone()?;
+        let mut download = download.lock().unwrap();
+        match download.result.take() {
+            Some(Ok(())) => {
+                self.status = format!("model {} downloaded", download.model);
+                self.download = None;
+                None
+            }
+            Some(Err(e)) => {
+                self.status = format!("error: downloading {} failed: {e:#}", download.model);
+                self.download = None;
+                None
+            }
+            None => {
+                let fraction = download.total.map(|t| download.done as f32 / t as f32);
+                let remaining =
+                    fraction.and_then(|f| eta(download.started, f as f64));
+                Some((
+                    format!(
+                        "downloading model {} — {} MB",
+                        download.model,
+                        download.done >> 20
+                    ),
+                    fraction,
+                    remaining,
+                ))
+            }
+        }
+    }
+
+    fn start_transcription(&mut self) {
+        let Some(source) = &self.source else { return };
+        let Some(models_dir) = self.models_dir.clone() else {
+            self.status = "error: models/ directory not found — cannot transcribe".into();
+            return;
+        };
+        let job = Arc::new(Mutex::new(Job {
+            status: match source {
+                Source::File(_) => "decoding ...".into(),
+                Source::Recording { .. } => "transcribing ...".into(),
+            },
+            ..Job::default()
+        }));
+        self.job = Some(job.clone());
+        self.transcript.clear();
+        self.status.clear();
+        self.speaker_voices.clear();
+        self.rename_inputs.clear();
+        self.show_rename = false;
+
+        let Some(model_path) = self.model_path() else {
+            return;
+        };
+        let opts = Options {
+            model: model_path,
+            prompt: transcribe::build_prompt(&self.vocabulary, &self.context),
+            known_speakers: self.profiles.iter().map(|p| p.name.clone()).collect(),
+            context: format!("{}\n{}", self.context, self.vocabulary),
+            timestamps: self.timestamps,
+            diarize: self.diarize.then(|| DiarizeModels {
+                segmentation_model: models_dir.join("segmentation-3.0.onnx"),
+                embedding_model: models_dir.join("wespeaker_en_voxceleb_CAM++.onnx"),
+                profiles: self.profiles.clone(),
+                max_speakers: self.max_speakers.unwrap_or(8),
+                ..DiarizeModels::default()
+            }),
+            ..Options::default()
+        };
+        enum Input {
+            File(PathBuf),
+            Samples(Arc<Vec<f32>>),
+        }
+        let input = match source {
+            Source::File(path) => Input::File(path.clone()),
+            Source::Recording { samples, .. } => Input::Samples(samples.clone()),
+        };
+        std::thread::spawn(move || {
+            let progress = {
+                let job = job.clone();
+                move |progress: Progress| {
+                    let mut job = job.lock().unwrap();
+                    match progress {
+                        Progress::Decoded { audio_secs, .. } => {
+                            job.status = format!("decoded {audio_secs:.0}s of audio");
+                        }
+                        Progress::DetectingSpeakers => job.status = "detecting speakers ...".into(),
+                        Progress::Diarized { segments, .. } => {
+                            job.status = format!("diarized {segments} speech segments");
+                        }
+                        Progress::Transcribing { percent } => {
+                            job.status = "transcribing ...".into();
+                            job.percent = Some(percent);
+                            job.transcribe_started.get_or_insert_with(std::time::Instant::now);
+                        }
+                        Progress::Segment { text } => {
+                            job.live.push_str(&text);
+                            job.live.push('\n');
+                        }
+                        Progress::Transcribed { .. } => job.percent = Some(100),
+                    }
+                }
+            };
+            let result = match input {
+                Input::File(path) => transcribe::transcribe(&path, &opts, progress),
+                Input::Samples(samples) => {
+                    transcribe::transcribe_samples((*samples).clone(), &opts, progress)
+                }
+            };
+            job.lock().unwrap().result = Some(result);
+        });
+    }
+
+    /// Collect worker updates; returns the current in-flight status, if any.
+    fn poll_job(&mut self) -> Option<(String, Option<i32>, Option<String>)> {
+        let job = self.job.clone()?;
+        let mut job = job.lock().unwrap();
+        match job.result.take() {
+            Some(Ok(transcript)) => {
+                self.transcript = transcript.text;
+                self.speaker_voices = transcript.speaker_voices;
+                self.rename_inputs = vec![String::new(); self.speaker_voices.len()];
+                let mut status = match transcript.speakers {
+                    Some(n) => format!("done — {n} speaker(s) detected"),
+                    None => "done".into(),
+                };
+                if !transcript.speaker_matches.is_empty() {
+                    let names: Vec<String> = transcript
+                        .speaker_matches
+                        .iter()
+                        .map(|(name, s)| format!("{name} ({s:.2})"))
+                        .collect();
+                    status.push_str(&format!(", recognized: {}", names.join(", ")));
+                }
+                if !transcript.weak_matches.is_empty() {
+                    let names: Vec<String> = transcript
+                        .weak_matches
+                        .iter()
+                        .map(|(name, s)| format!("{name} ({s:.2})"))
+                        .collect();
+                    status.push_str(&format!(
+                        " — {} matched too weakly and stayed numbered; consider re-enrolling",
+                        names.join(", ")
+                    ));
+                }
+                self.status = status;
+                self.job = None;
+                None
+            }
+            Some(Err(e)) => {
+                self.status = format!("error: {e:#}");
+                self.job = None;
+                None
+            }
+            None => {
+                // Mirror streamed segments into the transcript view live.
+                if self.transcript.len() != job.live.len() {
+                    self.transcript = job.live.clone();
+                }
+                let remaining = match (job.percent, job.transcribe_started) {
+                    (Some(p), Some(t0)) => eta(t0, p as f64 / 100.0),
+                    _ => None,
+                };
+                Some((job.status.clone(), job.percent, remaining))
+            }
+        }
+    }
+
+    /// Start or finish recording an enrollment sample. On finish, the
+    /// sample becomes a voice fingerprint stored under the entered name,
+    /// persisted to speakers.json for all future transcriptions.
+    fn toggle_enrollment(&mut self) {
+        match self.enroll_recorder.take() {
+            None if !mic_usage_declared() => {
+                self.status = MIC_PLIST_ERROR.into();
+            }
+            None => match Recorder::start(self.device.as_deref()) {
+                Ok(recorder) => self.enroll_recorder = Some(recorder),
+                Err(e) => self.status = format!("error: {e:#}"),
+            },
+            Some(recorder) => {
+                let result = recorder.stop().and_then(|samples| {
+                    let Some(dir) = &self.models_dir else {
+                        anyhow::bail!("models/ directory not found");
+                    };
+                    transcribe::diarize::voice_embedding(
+                        &samples,
+                        16_000,
+                        &dir.join("segmentation-3.0.onnx"),
+                        &dir.join("wespeaker_en_voxceleb_CAM++.onnx"),
+                    )
+                });
+                match result {
+                    Ok(embedding) => {
+                        let name = self.enroll_name.trim().to_owned();
+                        // Re-enrolling an existing name replaces their voice.
+                        self.profiles.retain(|p| p.name != name);
+                        self.profiles.push(SpeakerProfile { name, embedding });
+                        match transcribe::save_speaker_profiles(&self.speakers_path, &self.profiles)
+                        {
+                            Ok(()) => {
+                                self.status = format!("enrolled {}", self.enroll_name.trim());
+                                self.enroll_name.clear();
+                            }
+                            Err(e) => self.status = format!("error: {e:#}"),
+                        }
+                    }
+                    Err(e) => self.status = format!("error: enrollment failed: {e:#}"),
+                }
+            }
+        }
+    }
+
+    fn toggle_recording(&mut self) {
+        match self.recorder.take() {
+            None if !mic_usage_declared() => {
+                self.status = MIC_PLIST_ERROR.into();
+            }
+            None => match Recorder::start(self.device.as_deref()) {
+                Ok(recorder) => {
+                    self.recorder = Some(recorder);
+                    self.source = None;
+                    self.transcript.clear();
+                    self.status.clear();
+                }
+                Err(e) => self.status = format!("error: {e:#}"),
+            },
+            Some(recorder) => {
+                let secs = recorder.duration_secs();
+                match recorder.stop() {
+                    // Whisper hallucinates phrases like "Thank you." on silence,
+                    // so refuse to transcribe a recording with no signal in it.
+                    Ok(samples) if is_silent(&samples) => {
+                        self.status = "error: the recording contains no audio signal — \
+                            check that the input device isn't muted and that this app has \
+                            microphone access (System Settings → Privacy & Security → Microphone)"
+                            .into();
+                    }
+                    Ok(samples) => {
+                        self.source = Some(Source::Recording {
+                            samples: Arc::new(samples),
+                            secs,
+                        });
+                        self.status = format!("recorded {}", format_mmss(secs));
+                    }
+                    Err(e) => self.status = format!("error: {e:#}"),
+                }
+            }
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let running = self.poll_job();
+        let downloading = self.poll_download();
+        let enrolling = self.poll_enrollment();
+        // A dead input device would otherwise record silence forever.
+        if let Some(error) = self.recorder.as_ref().and_then(|r| r.error()) {
+            self.recorder = None;
+            self.status = format!("error: recording failed: {error}");
+        }
+        if running.is_some()
+            || downloading.is_some()
+            || enrolling
+            || self.recorder.is_some()
+            || self.enroll_recorder.is_some()
+        {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
+        let recording = self.recorder.is_some();
+        let busy = running.is_some() || recording;
+
+        let panel_frame = egui::Frame::side_top_panel(ui.style())
+            .inner_margin(egui::Margin::symmetric(16, 12));
+        egui::Panel::top("controls").frame(panel_frame).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!busy, egui::Button::new(format!("{FOLDER_OPEN} Open audio…")))
+                    .clicked()
+                    && let Some(file) = rfd::FileDialog::new()
+                        .add_filter("audio", &["mp3", "m4a", "mp4", "wav", "flac", "ogg"])
+                        .pick_file()
+                {
+                    self.source = Some(Source::File(file));
+                    self.transcript.clear();
+                    self.status.clear();
+                }
+                match (&self.source, self.recorder.as_ref()) {
+                    (_, Some(recorder)) => {
+                        ui.monospace(format!(
+                            "{MICROPHONE} recording {}",
+                            format_mmss(recorder.duration_secs())
+                        ));
+                        // Live input level, so a dead source (muted mic, missing
+                        // permission, unrouted loopback) is visible immediately.
+                        let level = recorder.level();
+                        ui.add(
+                            egui::ProgressBar::new((level * 4.0).min(1.0)).desired_width(80.0),
+                        )
+                        .on_hover_text("input level");
+                        if level == 0.0 && recorder.duration_secs() > 2.0 {
+                            ui.colored_label(ui.visuals().warn_fg_color, format!("{WARNING} no signal!"));
+                        }
+                    }
+                    (Some(source), _) => {
+                        ui.monospace(source.label());
+                    }
+                    (None, _) => {
+                        ui.weak("no audio loaded");
+                    }
+                };
+            });
+            ui.horizontal(|ui| {
+                let record_label = if recording {
+                    format!("{STOP} Stop")
+                } else {
+                    format!("{RECORD} Record")
+                };
+                let can_record = running.is_none() && self.enroll_recorder.is_none();
+                if ui.add_enabled(can_record, egui::Button::new(record_label)).clicked() {
+                    self.toggle_recording();
+                }
+                ui.label("from");
+                let selected = self.device.clone().unwrap_or_else(|| "default input".into());
+                egui::ComboBox::from_id_salt("device")
+                    .selected_text(selected)
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.device, None, "default input");
+                        for name in &self.devices {
+                            ui.selectable_value(&mut self.device, Some(name.clone()), name);
+                        }
+                    });
+                if ui.button(ARROWS_CLOCKWISE).on_hover_text("refresh device list").clicked() {
+                    self.devices = recorder::input_devices();
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                let labels: Vec<(String, String)> = WHISPER_MODELS
+                    .iter()
+                    .map(|m| {
+                        let installed = self
+                            .models_dir
+                            .as_ref()
+                            .is_some_and(|dir| dir.join(m.file).exists());
+                        let note = if m.note.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {}", m.note)
+                        };
+                        let label = if installed {
+                            format!("{CHECK} {}{note}", m.name)
+                        } else {
+                            format!("{DOWNLOAD_SIMPLE} {} ({}{note})", m.name, m.size)
+                        };
+                        (m.name.to_owned(), label)
+                    })
+                    .collect();
+                let model_enabled =
+                    self.models_dir.is_some() && running.is_none() && self.download.is_none();
+                let mut picked = false;
+                ui.add_enabled_ui(model_enabled, |ui| {
+                    egui::ComboBox::from_id_salt("model")
+                        .selected_text(&self.model)
+                        .show_ui(ui, |ui| {
+                            for (name, label) in &labels {
+                                picked |= ui
+                                    .selectable_value(&mut self.model, name.clone(), label)
+                                    .clicked();
+                            }
+                        });
+                });
+                if picked {
+                    self.start_download_if_missing();
+                }
+                ui.checkbox(&mut self.timestamps, "timestamps");
+                ui.checkbox(&mut self.diarize, "speakers");
+                if self.diarize {
+                    let selected = self
+                        .max_speakers
+                        .map_or("count: auto".to_owned(), |n| format!("count: {n}"));
+                    egui::ComboBox::from_id_salt("max-speakers")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.max_speakers, None, "auto (up to 8)");
+                            for n in 2..=8 {
+                                ui.selectable_value(&mut self.max_speakers, Some(n), n.to_string());
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "how many people are in the recording — setting it avoids \
+                             phantom extra speakers",
+                        );
+                }
+                if ui
+                    .button(format!("{BOOK_OPEN} Vocabulary…"))
+                    .on_hover_text("terms Whisper should spell correctly — product names, people, acronyms")
+                    .clicked()
+                {
+                    self.show_vocabulary = !self.show_vocabulary;
+                }
+                if ui
+                    .button(format!("{USERS} Speakers…"))
+                    .on_hover_text("enroll voices so speakers are named in the transcript")
+                    .clicked()
+                {
+                    self.show_speakers = !self.show_speakers;
+                }
+                if !self.speaker_voices.is_empty()
+                    && ui
+                        .button(format!("{NOTE_PENCIL} Rename…"))
+                        .on_hover_text("give the detected speakers real names")
+                        .clicked()
+                {
+                    self.show_rename = !self.show_rename;
+                }
+                let can_save = !self.transcript.is_empty() && !busy;
+                if ui
+                    .add_enabled(can_save, egui::Button::new(format!("{FLOPPY_DISK} Save transcript…")))
+                    .clicked()
+                {
+                    let name = match &self.source {
+                        Some(Source::File(path)) => path
+                            .file_stem()
+                            .map_or("transcript".into(), |s| s.to_string_lossy().into_owned()),
+                        _ => "transcript".into(),
+                    };
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name(format!("{name}.txt"))
+                        .add_filter("text", &["txt"])
+                        .save_file()
+                    {
+                        self.status = match std::fs::write(&path, &self.transcript) {
+                            Ok(()) => format!("saved to {}", path.display()),
+                            Err(e) => format!("error: failed to save: {e}"),
+                        };
+                    }
+                }
+            });
+            ui.add(
+                egui::TextEdit::multiline(&mut self.context)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(
+                        "context for this recording — meeting name, speakers, topics, notes \
+                         (sent to the transcription along with the vocabulary)",
+                    ),
+            );
+        });
+
+        egui::Panel::bottom("status").frame(panel_frame).show(ui, |ui| {
+            // Transcribe sits bottom-right; the status fills the space left of it.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let can_start = self.source.is_some()
+                    && !busy
+                    && self.download.is_none()
+                    && self.model_path().is_some_and(|p| p.exists());
+                if ui.add_enabled(can_start, egui::Button::new("Transcribe")).clicked() {
+                    self.start_transcription();
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    match (&running, &downloading) {
+                        (Some((status, percent, remaining)), _) => {
+                            ui.spinner();
+                            ui.label(status);
+                            if let Some(percent) = percent {
+                                let mut bar = egui::ProgressBar::new(*percent as f32 / 100.0);
+                                bar = match remaining {
+                                    Some(eta) => bar.text(format!("{percent}% — {eta}")),
+                                    None => bar.show_percentage(),
+                                };
+                                ui.add(bar);
+                            }
+                        }
+                        (None, Some((status, fraction, remaining))) => {
+                            ui.spinner();
+                            ui.label(status);
+                            if let Some(fraction) = fraction {
+                                let mut bar = egui::ProgressBar::new(*fraction);
+                                bar = match remaining {
+                                    Some(eta) => {
+                                        bar.text(format!("{:.0}% — {eta}", fraction * 100.0))
+                                    }
+                                    None => bar.show_percentage(),
+                                };
+                                ui.add(bar);
+                            }
+                        }
+                        (None, None) => {
+                            if !self.status.is_empty() {
+                                ui.label(&self.status);
+                            } else {
+                                ui.weak("open an audio file or record one, then hit Transcribe");
+                            }
+                        }
+                    }
+                });
+            });
+        });
+
+        let central_frame = egui::Frame::central_panel(ui.style())
+            .inner_margin(egui::Margin::symmetric(16, 12));
+        egui::CentralPanel::default().frame(central_frame).show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .stick_to_bottom(running.is_some())
+                .show(ui, |ui| {
+                    ui.add_sized(
+                        ui.available_size(),
+                        egui::TextEdit::multiline(&mut self.transcript)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("transcript appears here"),
+                    );
+                });
+        });
+
+        let mut show_vocabulary = self.show_vocabulary;
+        egui::Window::new("Vocabulary")
+            .open(&mut show_vocabulary)
+            .default_size([420.0, 320.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(
+                    "Terms Whisper would otherwise misspell — product names, \
+                     people, acronyms — one per line. The transcription is \
+                     biased toward these spellings.",
+                );
+                ui.weak(format!("saved to {}", self.vocabulary_path.display()));
+                ui.add_space(4.0);
+                let edit = egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        ui.add_sized(
+                            ui.available_size(),
+                            egui::TextEdit::multiline(&mut self.vocabulary)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("# Vocabulary\n- Kubernetes\n- Grafana\n- OKR"),
+                        )
+                    })
+                    .inner;
+                if edit.changed()
+                    && let Err(e) = std::fs::write(&self.vocabulary_path, &self.vocabulary)
+                {
+                    self.status = format!("error: failed to save vocabulary: {e}");
+                }
+            });
+        self.show_vocabulary = show_vocabulary;
+
+        let mut show_speakers = self.show_speakers;
+        egui::Window::new("Speakers")
+            .open(&mut show_speakers)
+            .default_size([380.0, 260.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(
+                    "Enroll a voice once and that person is named in every \
+                     future transcript instead of \"Speaker N\".",
+                );
+                ui.weak(format!("saved to {}", self.speakers_path.display()));
+                ui.add_space(6.0);
+
+                let mut remove: Option<usize> = None;
+                for (i, profile) in self.profiles.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{USERS} {}", profile.name));
+                        if ui.button(TRASH).on_hover_text("remove this voice").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    self.profiles.remove(i);
+                    if let Err(e) =
+                        transcribe::save_speaker_profiles(&self.speakers_path, &self.profiles)
+                    {
+                        self.status = format!("error: {e:#}");
+                    }
+                }
+                if self.profiles.is_empty() {
+                    ui.weak("no voices enrolled yet");
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label("Enroll a new voice — enter the name, then record \
+                    ~10 seconds of them speaking, or pick a recording where \
+                    only they speak (optionally a time range of it):");
+                let models_ready = self.models_dir.as_ref().is_some_and(|d| {
+                    d.join("segmentation-3.0.onnx").exists()
+                        && d.join("wespeaker_en_voxceleb_CAM++.onnx").exists()
+                });
+                let can_enroll = models_ready
+                    && !self.enroll_name.trim().is_empty()
+                    && self.recorder.is_none()
+                    && !enrolling;
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.enroll_name)
+                            .desired_width(140.0)
+                            .hint_text("name"),
+                    );
+                    match &self.enroll_recorder {
+                        None => {
+                            let button = egui::Button::new(format!("{RECORD} Record sample"));
+                            let response = ui.add_enabled(can_enroll, button);
+                            if !models_ready {
+                                response.on_hover_text(
+                                    "diarization models missing — run download-diarization-models.sh",
+                                );
+                            } else if response.clicked() {
+                                self.toggle_enrollment();
+                            }
+                        }
+                        Some(recorder) => {
+                            ui.add(
+                                egui::ProgressBar::new((recorder.level() * 4.0).min(1.0))
+                                    .desired_width(60.0),
+                            );
+                            ui.monospace(format_mmss(recorder.duration_secs()));
+                            if ui
+                                .button(format!("{STOP} Stop & enroll"))
+                                .clicked()
+                            {
+                                self.toggle_enrollment();
+                            }
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if enrolling {
+                        ui.spinner();
+                        ui.label("enrolling from file ...");
+                    } else {
+                        let button =
+                            egui::Button::new(format!("{FOLDER_OPEN} From audio file…"));
+                        let can_file =
+                            can_enroll && self.enroll_recorder.is_none();
+                        if ui.add_enabled(can_file, button).clicked()
+                            && let Some(file) = rfd::FileDialog::new()
+                                .add_filter("audio", &["mp3", "m4a", "mp4", "wav", "flac", "ogg"])
+                                .pick_file()
+                        {
+                            self.start_file_enrollment(file);
+                        }
+                        ui.label("from");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.enroll_from)
+                                .desired_width(48.0)
+                                .hint_text("0:00"),
+                        );
+                        ui.label("to");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.enroll_to)
+                                .desired_width(48.0)
+                                .hint_text("end"),
+                        );
+                    }
+                });
+            });
+        self.show_speakers = show_speakers;
+
+        let mut show_rename = self.show_rename;
+        egui::Window::new("Rename speakers")
+            .open(&mut show_rename)
+            .default_size([360.0, 240.0])
+            .show(ui.ctx(), |ui| {
+                ui.label("Give the voices from this transcript real names:");
+                ui.add_space(4.0);
+                for (voice, input) in self.speaker_voices.iter().zip(&mut self.rename_inputs) {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} →", voice.label));
+                        ui.add(
+                            egui::TextEdit::singleline(input)
+                                .desired_width(160.0)
+                                .hint_text("new name"),
+                        );
+                    });
+                }
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut self.enroll_on_rename,
+                    "also enroll these voices for future transcripts",
+                );
+                if ui.button(format!("{CHECK} Apply")).clicked() {
+                    let mut renamed = 0;
+                    for (voice, input) in
+                        self.speaker_voices.iter_mut().zip(&mut self.rename_inputs)
+                    {
+                        let new_name = input.trim().to_owned();
+                        if new_name.is_empty() || new_name == voice.label {
+                            continue;
+                        }
+                        self.transcript =
+                            transcribe::rename_speaker(&self.transcript, &voice.label, &new_name);
+                        if self.enroll_on_rename {
+                            self.profiles.retain(|p| p.name != new_name);
+                            self.profiles.push(SpeakerProfile {
+                                name: new_name.clone(),
+                                embedding: voice.embedding.clone(),
+                            });
+                        }
+                        voice.label = new_name;
+                        input.clear();
+                        renamed += 1;
+                    }
+                    if renamed > 0 {
+                        self.status = if self.enroll_on_rename {
+                            match transcribe::save_speaker_profiles(
+                                &self.speakers_path,
+                                &self.profiles,
+                            ) {
+                                Ok(()) => format!(
+                                    "renamed and enrolled {renamed} speaker(s) — future \
+                                     transcripts will use these names"
+                                ),
+                                Err(e) => format!("renamed, but enrolling failed: {e:#}"),
+                            }
+                        } else {
+                            format!("renamed {renamed} speaker(s)")
+                        };
+                    }
+                }
+            });
+        self.show_rename = show_rename;
+    }
+}
+
+fn format_mmss(secs: f64) -> String {
+    let s = secs as u64;
+    format!("{:02}:{:02}", s / 60, s % 60)
+}
+
+/// "1 minute 2 seconds remaining" from an estimated remaining duration.
+fn format_eta(secs: f64) -> String {
+    let s = secs.ceil().max(0.0) as u64;
+    let plural = |n: u64| if n == 1 { "" } else { "s" };
+    if s >= 3600 {
+        let (h, m) = (s / 3600, (s % 3600) / 60);
+        format!("{h} hour{} {m} minute{} remaining", plural(h), plural(m))
+    } else if s >= 60 {
+        let (m, r) = (s / 60, s % 60);
+        format!("{m} minute{} {r} second{} remaining", plural(m), plural(r))
+    } else {
+        format!("{s} second{} remaining", plural(s))
+    }
+}
+
+/// Remaining time extrapolated from elapsed time and completed fraction.
+fn eta(started: std::time::Instant, fraction: f64) -> Option<String> {
+    if !(0.01..1.0).contains(&fraction) {
+        return None;
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    // Too early to extrapolate meaningfully.
+    if elapsed < 2.0 {
+        return None;
+    }
+    Some(format_eta(elapsed * (1.0 - fraction) / fraction))
+}
+
+/// Parse "mm:ss", "h:mm:ss", or plain seconds. Empty input is Ok(None);
+/// unparseable input is returned as the error.
+fn parse_time(s: &str) -> Result<Option<f64>, &str> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let mut total = 0.0;
+    for part in s.split(':') {
+        match part.parse::<f64>() {
+            Ok(v) if v >= 0.0 => total = total * 60.0 + v,
+            _ => return Err(s),
+        }
+    }
+    Ok(Some(total))
+}
+
+/// macOS kills a bundled app the moment it opens the microphone if its
+/// Info.plist lacks NSMicrophoneUsageDescription — which happens when the
+/// bundle is built with plain `cargo bundle` instead of ./bundle.sh.
+/// Detect that here so recording can refuse with an explanation instead.
+fn mic_usage_declared() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return true;
+    };
+    // …/Transcribe.app/Contents/MacOS/transcribe-gui → …/Contents/Info.plist
+    let Some(contents) = exe.parent().and_then(|dir| dir.parent()) else {
+        return true;
+    };
+    if contents.file_name().and_then(|n| n.to_str()) != Some("Contents") {
+        return true; // not running from an .app bundle
+    }
+    match std::fs::read(contents.join("Info.plist")) {
+        // The key name appears as plain ASCII in both XML and binary plists.
+        Ok(bytes) => {
+            let key = b"NSMicrophoneUsageDescription";
+            bytes.windows(key.len()).any(|w| w == key)
+        }
+        Err(_) => true,
+    }
+}
+
+/// True when there's no usable signal anywhere in the recording. Even a
+/// quiet room leaves a mic noise floor well above this; only a dead input
+/// (muted, no permission, unrouted loopback) stays this low throughout.
+fn is_silent(samples: &[f32]) -> bool {
+    samples.iter().all(|s| s.abs() < 1e-4)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_time;
+
+    #[test]
+    fn parses_enrollment_time_ranges() {
+        assert_eq!(parse_time("  "), Ok(None));
+        assert_eq!(parse_time("90"), Ok(Some(90.0)));
+        assert_eq!(parse_time("1:30"), Ok(Some(90.0)));
+        assert_eq!(parse_time("1:02:03"), Ok(Some(3723.0)));
+        assert_eq!(parse_time("abc"), Err("abc"));
+        assert_eq!(parse_time("1:-2"), Err("1:-2"));
+    }
+}

@@ -1,0 +1,12 @@
+/target
+/models
+*.mp3
+*.mp4
+*.m4a
+*.wav
+*.txt
+!assets/fonts/LICENSE.txt
+!vendor/**/*.txt
+.DS_*
+.claude/
+speakers.json
