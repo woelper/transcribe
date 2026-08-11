@@ -1,0 +1,5 @@
+# Force LF on checkout everywhere. Windows runners default to
+# core.autocrlf=true, and a CRLF vendor/ort-sys/dist.txt breaks the ort-sys
+# build script: it splits lines on \n only, so the sha256 field keeps a
+# trailing \r and hash verification panics.
+* text=auto eol=lf
