@@ -33,8 +33,13 @@ whisper-rs = "0.16.0"
 [patch.crates-io]
 ort-sys = { path = "vendor/ort-sys" }
 
+# min-sized-rust: https://github.com/johnthagen/min-sized-rust
 [profile.release]
-lto = "thin"
+strip = true         # strip symbols from the binary
+opt-level = "z"      # optimize for size
+lto = true           # fat LTO across all crates
+codegen-units = 1    # better optimization, slower compile
+panic = "abort"      # drop unwinding machinery
 
 # `./bundle.sh` builds Transcribe.app from the GUI binary (see README)
 [package.metadata.bundle.bin.transcribe-gui]
