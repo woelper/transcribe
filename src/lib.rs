@@ -19,6 +19,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 pub mod diarize;
 pub mod download;
 pub mod recorder;
+pub mod summarize;
 
 pub const WHISPER_SAMPLE_RATE: usize = 16_000;
 

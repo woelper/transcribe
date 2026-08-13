@@ -4,11 +4,14 @@ use std::time::Duration;
 
 use eframe::egui;
 use egui_phosphor::regular::{
-    ARROWS_CLOCKWISE, BOOK_OPEN, CHECK, DOWNLOAD_SIMPLE, FLOPPY_DISK, FOLDER_OPEN, MICROPHONE,
-    NOTE_PENCIL, RECORD, STOP, TRASH, USERS, WARNING,
+    ARROWS_CLOCKWISE, BOOK_OPEN, CHECK, COPY, DOWNLOAD_SIMPLE, FLOPPY_DISK, FOLDER_OPEN,
+    LIST_BULLETS, MICROPHONE, NOTE_PENCIL, RECORD, STOP, TRASH, USERS, WARNING,
 };
 use transcribe::diarize::SpeakerProfile;
-use transcribe::download::{WHISPER_MODELS, model_by_name};
+use transcribe::download::{
+    DIARIZATION_MODELS, SUMMARY_MODEL_FILE, SUMMARY_MODEL_SIZE, SUMMARY_MODEL_URL, WHISPER_MODELS,
+    model_by_name,
+};
 use transcribe::recorder::{self, Recorder};
 use transcribe::{DiarizeModels, Options, Progress, SpeakerVoice, Transcript};
 
@@ -164,7 +167,9 @@ struct Job {
 
 /// State of a model download running in a background thread.
 struct Download {
-    model: String,
+    /// What is being fetched, as shown in the status line, e.g.
+    /// "model tiny" or "speaker detection models".
+    what: String,
     started: std::time::Instant,
     done: u64,
     total: Option<u64>,
@@ -208,6 +213,12 @@ struct App {
     rename_inputs: Vec<String>,
     show_rename: bool,
     enroll_on_rename: bool,
+    summary: String,
+    show_summary: bool,
+    summary_job: Option<Arc<Mutex<Summary>>>,
+    /// Summarize was clicked before the summary model was on disk; start
+    /// summarizing as soon as its download finishes.
+    summarize_pending: bool,
 }
 
 /// A file-based enrollment running in a background thread (decoding and
@@ -215,6 +226,13 @@ struct App {
 struct Enroll {
     name: String,
     result: Option<anyhow::Result<Vec<f32>>>,
+}
+
+/// A summarization running in a background thread.
+struct Summary {
+    /// Partial summary text, streamed in as it generates.
+    live: String,
+    result: Option<anyhow::Result<String>>,
 }
 
 impl App {
@@ -265,6 +283,10 @@ impl App {
             rename_inputs: Vec::new(),
             show_rename: false,
             enroll_on_rename: true,
+            summary: String::new(),
+            show_summary: false,
+            summary_job: None,
+            summarize_pending: false,
         }
     }
 
@@ -352,22 +374,20 @@ impl App {
         self.models_dir.as_ref().map(|dir| dir.join(model.file))
     }
 
-    /// Fetch the selected model in the background if it isn't on disk yet.
-    fn start_download_if_missing(&mut self) {
-        let Some(path) = self.model_path() else { return };
-        let Some(model) = model_by_name(&self.model) else { return };
-        if path.exists() || self.download.is_some() {
+    /// Fetch `url` into `path` in the background, shown in the status bar
+    /// as `what`. Only one download runs at a time.
+    fn start_file_download(&mut self, what: String, url: String, path: PathBuf) {
+        if self.download.is_some() {
             return;
         }
         let download = Arc::new(Mutex::new(Download {
-            model: self.model.clone(),
+            what,
             started: std::time::Instant::now(),
             done: 0,
             total: None,
             result: None,
         }));
         self.download = Some(download.clone());
-        let url = model.url.to_owned();
         std::thread::spawn(move || {
             let progress = {
                 let download = download.clone();
@@ -382,19 +402,152 @@ impl App {
         });
     }
 
+    /// Fetch the selected model in the background if it isn't on disk yet.
+    fn start_download_if_missing(&mut self) {
+        let Some(path) = self.model_path() else { return };
+        let Some(model) = model_by_name(&self.model) else { return };
+        if path.exists() {
+            return;
+        }
+        self.start_file_download(format!("model {}", self.model), model.url.to_owned(), path);
+    }
+
+    /// Whether the speaker-detection (diarization) models are on disk.
+    fn diarization_models_ready(&self) -> bool {
+        self.models_dir
+            .as_ref()
+            .is_some_and(|dir| DIARIZATION_MODELS.iter().all(|m| dir.join(m.file).exists()))
+    }
+
+    /// Fetch any missing speaker-detection models in the background, so a
+    /// released binary works without the repo's download scripts.
+    fn start_diarization_download_if_missing(&mut self) {
+        let Some(dir) = self.models_dir.clone() else { return };
+        if self.download.is_some() {
+            return;
+        }
+        let missing: Vec<(PathBuf, &'static str)> = DIARIZATION_MODELS
+            .iter()
+            .filter(|m| !dir.join(m.file).exists())
+            .map(|m| (dir.join(m.file), m.url))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let download = Arc::new(Mutex::new(Download {
+            what: "speaker detection models".into(),
+            started: std::time::Instant::now(),
+            done: 0,
+            total: None,
+            result: None,
+        }));
+        self.download = Some(download.clone());
+        std::thread::spawn(move || {
+            let mut result = Ok(());
+            for (path, url) in missing {
+                // Cumulative progress across both files; the combined size
+                // isn't known up front, so `total` stays None and the status
+                // line shows a plain MB counter.
+                let base = download.lock().unwrap().done;
+                let progress = {
+                    let download = download.clone();
+                    move |done, _total| download.lock().unwrap().done = base + done
+                };
+                result = transcribe::download::download(url, &path, progress);
+                if result.is_err() {
+                    break;
+                }
+            }
+            download.lock().unwrap().result = Some(result);
+        });
+    }
+
+    fn summary_model_path(&self) -> Option<PathBuf> {
+        self.models_dir.as_ref().map(|dir| dir.join(SUMMARY_MODEL_FILE))
+    }
+
+    /// Summarize the transcript with the local chat model, fetching the
+    /// model first if it isn't on disk yet.
+    fn start_summarization(&mut self) {
+        let Some(path) = self.summary_model_path() else { return };
+        if !path.exists() {
+            self.summarize_pending = true;
+            self.start_file_download(
+                "summary model".into(),
+                SUMMARY_MODEL_URL.to_owned(),
+                path,
+            );
+            return;
+        }
+        let job = Arc::new(Mutex::new(Summary {
+            live: String::new(),
+            result: None,
+        }));
+        self.summary_job = Some(job.clone());
+        self.summary.clear();
+        self.show_summary = true;
+        let transcript = self.transcript.clone();
+        let context = self.context.clone();
+        std::thread::spawn(move || {
+            let progress = {
+                let job = job.clone();
+                move |text: &str| job.lock().unwrap().live = text.to_owned()
+            };
+            let result = transcribe::summarize::summarize(&path, &transcript, &context, &progress);
+            job.lock().unwrap().result = Some(result);
+        });
+    }
+
+    /// Collect summary updates; returns whether one is running.
+    fn poll_summary(&mut self) -> bool {
+        let Some(job) = self.summary_job.clone() else {
+            return false;
+        };
+        let mut job = job.lock().unwrap();
+        match job.result.take() {
+            Some(Ok(summary)) => {
+                self.summary = summary;
+                self.status = "summary ready".into();
+                self.summary_job = None;
+                false
+            }
+            Some(Err(e)) => {
+                self.status = format!("error: summarization failed: {e:#}");
+                self.summary_job = None;
+                false
+            }
+            None => {
+                self.summary = job.live.clone();
+                true
+            }
+        }
+    }
+
     /// Collect download updates; returns the in-flight progress, if any.
     fn poll_download(&mut self) -> Option<(String, Option<f32>, Option<String>)> {
         let download = self.download.clone()?;
         let mut download = download.lock().unwrap();
         match download.result.take() {
             Some(Ok(())) => {
-                self.status = format!("model {} downloaded", download.model);
+                self.status = format!("{} downloaded", download.what);
                 self.download = None;
+                // A "speakers" request made while this download was running
+                // was skipped (one download at a time) — pick it up now.
+                if self.diarize {
+                    self.start_diarization_download_if_missing();
+                }
+                if self.summarize_pending
+                    && self.summary_model_path().is_some_and(|p| p.exists())
+                {
+                    self.summarize_pending = false;
+                    self.start_summarization();
+                }
                 None
             }
             Some(Err(e)) => {
-                self.status = format!("error: downloading {} failed: {e:#}", download.model);
+                self.status = format!("error: downloading {} failed: {e:#}", download.what);
                 self.download = None;
+                self.summarize_pending = false;
                 None
             }
             None => {
@@ -403,8 +556,8 @@ impl App {
                     fraction.and_then(|f| eta(download.started, f as f64));
                 Some((
                     format!(
-                        "downloading model {} — {} MB",
-                        download.model,
+                        "downloading {} — {} MB",
+                        download.what,
                         download.done >> 20
                     ),
                     fraction,
@@ -640,6 +793,7 @@ impl eframe::App for App {
         let running = self.poll_job();
         let downloading = self.poll_download();
         let enrolling = self.poll_enrollment();
+        let summarizing = self.poll_summary();
         // A dead input device would otherwise record silence forever.
         if let Some(error) = self.recorder.as_ref().and_then(|r| r.error()) {
             self.recorder = None;
@@ -648,6 +802,7 @@ impl eframe::App for App {
         if running.is_some()
             || downloading.is_some()
             || enrolling
+            || summarizing
             || self.recorder.is_some()
             || self.enroll_recorder.is_some()
         {
@@ -760,7 +915,9 @@ impl eframe::App for App {
                     self.start_download_if_missing();
                 }
                 ui.checkbox(&mut self.timestamps, "timestamps");
-                ui.checkbox(&mut self.diarize, "speakers");
+                if ui.checkbox(&mut self.diarize, "speakers").changed() && self.diarize {
+                    self.start_diarization_download_if_missing();
+                }
                 if self.diarize {
                     let selected = self
                         .max_speakers
@@ -800,6 +957,31 @@ impl eframe::App for App {
                         .clicked()
                 {
                     self.show_rename = !self.show_rename;
+                }
+                let summary_model_missing =
+                    self.summary_model_path().is_none_or(|p| !p.exists());
+                let can_summarize = !self.transcript.trim().is_empty()
+                    && !busy
+                    && self.summary_job.is_none()
+                    && self.download.is_none()
+                    && self.models_dir.is_some();
+                let summarize_hover = if summary_model_missing {
+                    format!(
+                        "summarize the transcript with a local Llama model — \
+                         first use downloads it ({SUMMARY_MODEL_SIZE})"
+                    )
+                } else {
+                    "summarize the transcript with the local Llama model".into()
+                };
+                if ui
+                    .add_enabled(
+                        can_summarize,
+                        egui::Button::new(format!("{LIST_BULLETS} Summarize")),
+                    )
+                    .on_hover_text(summarize_hover)
+                    .clicked()
+                {
+                    self.start_summarization();
                 }
                 let can_save = !self.transcript.is_empty() && !busy;
                 if ui
@@ -841,7 +1023,8 @@ impl eframe::App for App {
                 let can_start = self.source.is_some()
                     && !busy
                     && self.download.is_none()
-                    && self.model_path().is_some_and(|p| p.exists());
+                    && self.model_path().is_some_and(|p| p.exists())
+                    && (!self.diarize || self.diarization_models_ready());
                 if ui.add_enabled(can_start, egui::Button::new("Transcribe")).clicked() {
                     self.start_transcription();
                 }
@@ -932,6 +1115,39 @@ impl eframe::App for App {
             });
         self.show_vocabulary = show_vocabulary;
 
+        let mut show_summary = self.show_summary;
+        egui::Window::new("Summary")
+            .open(&mut show_summary)
+            .default_size([480.0, 360.0])
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    if summarizing {
+                        ui.spinner();
+                        ui.label("summarizing ...");
+                    } else if ui
+                        .add_enabled(
+                            !self.summary.is_empty(),
+                            egui::Button::new(format!("{COPY} Copy")),
+                        )
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(self.summary.clone());
+                    }
+                });
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .stick_to_bottom(summarizing)
+                    .show(ui, |ui| {
+                        ui.add_sized(
+                            ui.available_size(),
+                            egui::TextEdit::multiline(&mut self.summary)
+                                .hint_text("the summary appears here"),
+                        );
+                    });
+            });
+        self.show_summary = show_summary;
+
         let mut show_speakers = self.show_speakers;
         egui::Window::new("Speakers")
             .open(&mut show_speakers)
@@ -970,10 +1186,23 @@ impl eframe::App for App {
                 ui.label("Enroll a new voice — enter the name, then record \
                     ~10 seconds of them speaking, or pick a recording where \
                     only they speak (optionally a time range of it):");
-                let models_ready = self.models_dir.as_ref().is_some_and(|d| {
-                    d.join("segmentation-3.0.onnx").exists()
-                        && d.join("wespeaker_en_voxceleb_CAM++.onnx").exists()
-                });
+                let models_ready = self.diarization_models_ready();
+                if !models_ready {
+                    ui.horizontal(|ui| {
+                        if self.download.is_some() {
+                            ui.spinner();
+                            ui.label("downloading ...");
+                        } else if ui
+                            .button(format!(
+                                "{DOWNLOAD_SIMPLE} Download speaker detection models (34 MB)"
+                            ))
+                            .clicked()
+                        {
+                            self.start_diarization_download_if_missing();
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
                 let can_enroll = models_ready
                     && !self.enroll_name.trim().is_empty()
                     && self.recorder.is_none()
@@ -990,7 +1219,7 @@ impl eframe::App for App {
                             let response = ui.add_enabled(can_enroll, button);
                             if !models_ready {
                                 response.on_hover_text(
-                                    "diarization models missing — run download-diarization-models.sh",
+                                    "speaker detection models missing — download them above",
                                 );
                             } else if response.clicked() {
                                 self.toggle_enrollment();

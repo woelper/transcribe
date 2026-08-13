@@ -54,6 +54,32 @@ pub fn model_by_name(name: &str) -> Option<&'static WhisperModel> {
     WHISPER_MODELS.iter().find(|m| m.name == name)
 }
 
+pub struct DiarizationModel {
+    /// Local filename under models/.
+    pub file: &'static str,
+    pub url: &'static str,
+}
+
+/// Chat model used by the Summarize button: Llama 3.2 3B Instruct,
+/// Q4_K_M-quantized. Small enough to run on CPU at usable speed while
+/// still producing solid meeting summaries.
+pub const SUMMARY_MODEL_FILE: &str = "Llama-3.2-3B-Instruct-Q4_K_M.gguf";
+pub const SUMMARY_MODEL_URL: &str = "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf";
+pub const SUMMARY_MODEL_SIZE: &str = "2.0 GB";
+
+/// Speaker-diarization ONNX models (pyannote segmentation + wespeaker
+/// embeddings, ~34 MB total), mirrored by the pyannote-rs project.
+pub const DIARIZATION_MODELS: &[DiarizationModel] = &[
+    DiarizationModel {
+        file: "segmentation-3.0.onnx",
+        url: "https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/segmentation-3.0.onnx",
+    },
+    DiarizationModel {
+        file: "wespeaker_en_voxceleb_CAM++.onnx",
+        url: "https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/wespeaker_en_voxceleb_CAM++.onnx",
+    },
+];
+
 /// Stream `url` into `dest`, calling `progress` with
 /// (downloaded_bytes, total_bytes_if_known) along the way. Writes through
 /// a .part file so an aborted download never leaves a truncated `dest`.

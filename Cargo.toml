@@ -21,12 +21,14 @@ serde_json = "1.0.151"
 symphonia = { version = "0.6.0", features = ["aac", "isomp4", "mp3"] }
 ureq = "3.3.0"
 # Metal GPU acceleration exists only on Apple platforms; other targets
-# build whisper.cpp for CPU.
+# build whisper.cpp/llama.cpp for CPU.
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.16.0", features = ["metal"] }
+llama-cpp-2 = { version = "0.1.154", features = ["metal"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 whisper-rs = "0.16.0"
+llama-cpp-2 = "0.1.154"
 
 # Local copy of ort-sys with its binary-download build dependency switched
 # from native-tls (openssl) to rustls, keeping the build openssl-free.
