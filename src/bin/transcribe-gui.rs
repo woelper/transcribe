@@ -45,10 +45,77 @@ fn main() -> eframe::Result {
     )
 }
 
-/// IBM Plex typography, a soft light palette, and roomy rounded
-/// borderless buttons.
+// The palette, lifted from the design reference: white cards floating on
+// a lavender ground, one violet accent, green for anything live (levels,
+// toggles), red for recording.
+const TEXT: egui::Color32 = egui::Color32::from_rgb(0x26, 0x28, 0x3d);
+const GROUND: egui::Color32 = egui::Color32::from_rgb(0xf1, 0xf2, 0xf9);
+const CARD: egui::Color32 = egui::Color32::WHITE;
+const FIELD: egui::Color32 = egui::Color32::from_rgb(0xf3, 0xf4, 0xfa);
+const BUTTON: egui::Color32 = egui::Color32::from_rgb(0xec, 0xee, 0xf6);
+const BUTTON_HOVER: egui::Color32 = egui::Color32::from_rgb(0xe1, 0xe4, 0xf1);
+const HAIRLINE: egui::Color32 = egui::Color32::from_rgb(0xe6, 0xe8, 0xf2);
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x6c, 0x5c, 0xe7);
+const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(0xe9, 0xe6, 0xfb);
+const GREEN: egui::Color32 = egui::Color32::from_rgb(0x2b, 0xd8, 0x8f);
+const RED: egui::Color32 = egui::Color32::from_rgb(0xef, 0x50, 0x6e);
+const TRACK_OFF: egui::Color32 = egui::Color32::from_rgb(0xd8, 0xdb, 0xe8);
+const SHADOW: egui::Color32 = egui::Color32::from_rgba_premultiplied(9, 10, 14, 30);
+
+/// White rounded card with a soft drop shadow — the base surface every
+/// panel and window sits on.
+fn card() -> egui::Frame {
+    egui::Frame::new()
+        .fill(CARD)
+        .corner_radius(egui::CornerRadius::same(16))
+        .shadow(egui::Shadow { offset: [0, 2], blur: 10, spread: 0, color: SHADOW })
+        .inner_margin(egui::Margin::same(14))
+}
+
+/// Solid filled button with white text, for accented actions.
+fn filled_button(text: String, fill: egui::Color32) -> egui::Button<'static> {
+    egui::Button::new(
+        egui::RichText::new(text)
+            .color(egui::Color32::WHITE)
+            .family(egui::FontFamily::Name("plex-medium".into())),
+    )
+    .fill(fill)
+}
+
+/// Violet button for the one action that matters in a view.
+fn primary_button(text: String) -> egui::Button<'static> {
+    filled_button(text, ACCENT)
+}
+
+/// Animated on/off switch, green when on — replaces checkboxes to match
+/// the reference. The label toggles too.
+fn toggle(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 7.0;
+        let size = egui::vec2(36.0, 20.0);
+        let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
+        let text = ui.add(egui::Label::new(label).sense(egui::Sense::click()));
+        if response.clicked() || text.clicked() {
+            *on = !*on;
+            response.mark_changed();
+        }
+        if ui.is_rect_visible(rect) {
+            let t = ui.ctx().animate_bool_responsive(response.id, *on);
+            let radius = rect.height() / 2.0;
+            ui.painter().rect_filled(rect, radius, TRACK_OFF.lerp_to_gamma(GREEN, t));
+            let x = egui::lerp(rect.left() + radius..=rect.right() - radius, t);
+            let knob = egui::pos2(x, rect.center().y);
+            ui.painter().circle_filled(knob, radius - 3.0, egui::Color32::WHITE);
+        }
+        response | text
+    })
+    .inner
+}
+
+/// IBM Plex typography over the reference palette, with roomy rounded
+/// borderless widgets and soft shadows.
 fn setup_theme(ctx: &egui::Context) {
-    use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle, vec2};
+    use egui::{CornerRadius, FontFamily, FontId, Shadow, Stroke, TextStyle, vec2};
 
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
@@ -97,42 +164,39 @@ fn setup_theme(ctx: &egui::Context) {
     style.spacing.button_padding = vec2(14.0, 7.0);
     style.spacing.interact_size = vec2(40.0, 32.0);
 
-    let text = Color32::from_rgb(0x30, 0x34, 0x3c);
-    let accent = Color32::from_rgb(0x11, 0x72, 0xdc);
-    let button = Color32::from_rgb(0xe9, 0xed, 0xf3);
-    let button_hover = Color32::from_rgb(0xdd, 0xe4, 0xee);
-    let button_press = Color32::from_rgb(0xc4, 0xe1, 0xfb);
-
     let mut v = egui::Visuals::light();
-    v.override_text_color = Some(text);
-    v.panel_fill = Color32::from_rgb(0xf7, 0xf8, 0xfb);
-    v.window_fill = Color32::from_rgb(0xf7, 0xf8, 0xfb);
-    v.extreme_bg_color = Color32::WHITE; // text-edit backgrounds
-    v.faint_bg_color = Color32::from_rgb(0xee, 0xf1, 0xf6);
-    v.selection.bg_fill = button_press;
-    v.selection.stroke = Stroke::new(1.0, accent);
-    v.hyperlink_color = accent;
-    v.window_corner_radius = CornerRadius::same(12);
+    v.override_text_color = Some(TEXT);
+    v.panel_fill = GROUND;
+    v.window_fill = CARD;
+    v.window_stroke = Stroke::new(1.0, HAIRLINE);
+    v.window_corner_radius = CornerRadius::same(16);
+    v.window_shadow = Shadow { offset: [0, 8], blur: 32, spread: 0, color: SHADOW };
+    v.popup_shadow = Shadow { offset: [0, 4], blur: 16, spread: 0, color: SHADOW };
+    v.extreme_bg_color = FIELD; // text-edit backgrounds, progress troughs
+    v.faint_bg_color = FIELD;
+    v.selection.bg_fill = ACCENT_SOFT;
+    v.selection.stroke = Stroke::new(1.0, ACCENT);
+    v.hyperlink_color = ACCENT;
     for w in [
         &mut v.widgets.inactive,
         &mut v.widgets.hovered,
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.corner_radius = CornerRadius::same(10);
+        w.corner_radius = CornerRadius::same(12);
         w.bg_stroke = Stroke::NONE;
         w.expansion = 0.0;
     }
-    v.widgets.noninteractive.corner_radius = CornerRadius::same(10);
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xdf, 0xe3, 0xea));
-    v.widgets.inactive.weak_bg_fill = button;
-    v.widgets.inactive.bg_fill = button;
-    v.widgets.hovered.weak_bg_fill = button_hover;
-    v.widgets.hovered.bg_fill = button_hover;
-    v.widgets.active.weak_bg_fill = button_press;
-    v.widgets.active.bg_fill = button_press;
-    v.widgets.open.weak_bg_fill = button_hover;
-    v.widgets.open.bg_fill = button_hover;
+    v.widgets.noninteractive.corner_radius = CornerRadius::same(12);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, HAIRLINE);
+    v.widgets.inactive.weak_bg_fill = BUTTON;
+    v.widgets.inactive.bg_fill = BUTTON;
+    v.widgets.hovered.weak_bg_fill = BUTTON_HOVER;
+    v.widgets.hovered.bg_fill = BUTTON_HOVER;
+    v.widgets.active.weak_bg_fill = ACCENT_SOFT;
+    v.widgets.active.bg_fill = ACCENT_SOFT;
+    v.widgets.open.weak_bg_fill = BUTTON_HOVER;
+    v.widgets.open.bg_fill = BUTTON_HOVER;
     style.visuals = v;
     ctx.set_style_of(egui::Theme::Light, style);
 }
@@ -789,6 +853,11 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// The lavender ground the panel cards float on.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        GROUND.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let running = self.poll_job();
         let downloading = self.poll_download();
@@ -811,9 +880,11 @@ impl eframe::App for App {
         let recording = self.recorder.is_some();
         let busy = running.is_some() || recording;
 
-        let panel_frame = egui::Frame::side_top_panel(ui.style())
-            .inner_margin(egui::Margin::symmetric(16, 12));
-        egui::Panel::top("controls").frame(panel_frame).show(ui, |ui| {
+        // Each panel is a white card floating on the lavender ground; the
+        // ground itself is painted by clear_color() below.
+        let top_frame =
+            card().outer_margin(egui::Margin { left: 16, right: 16, top: 16, bottom: 8 });
+        egui::Panel::top("controls").frame(top_frame).show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(!busy, egui::Button::new(format!("{FOLDER_OPEN} Open audio…")))
@@ -828,15 +899,21 @@ impl eframe::App for App {
                 }
                 match (&self.source, self.recorder.as_ref()) {
                     (_, Some(recorder)) => {
-                        ui.monospace(format!(
-                            "{MICROPHONE} recording {}",
-                            format_mmss(recorder.duration_secs())
-                        ));
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{MICROPHONE} recording {}",
+                                format_mmss(recorder.duration_secs())
+                            ))
+                            .monospace()
+                            .color(RED),
+                        );
                         // Live input level, so a dead source (muted mic, missing
                         // permission, unrouted loopback) is visible immediately.
                         let level = recorder.level();
                         ui.add(
-                            egui::ProgressBar::new((level * 4.0).min(1.0)).desired_width(80.0),
+                            egui::ProgressBar::new((level * 4.0).min(1.0))
+                                .desired_width(80.0)
+                                .fill(GREEN),
                         )
                         .on_hover_text("input level");
                         if level == 0.0 && recorder.duration_secs() > 2.0 {
@@ -852,13 +929,13 @@ impl eframe::App for App {
                 };
             });
             ui.horizontal(|ui| {
-                let record_label = if recording {
-                    format!("{STOP} Stop")
+                let record_button = if recording {
+                    filled_button(format!("{STOP} Stop"), RED)
                 } else {
-                    format!("{RECORD} Record")
+                    egui::Button::new(format!("{RECORD} Record"))
                 };
                 let can_record = running.is_none() && self.enroll_recorder.is_none();
-                if ui.add_enabled(can_record, egui::Button::new(record_label)).clicked() {
+                if ui.add_enabled(can_record, record_button).clicked() {
                     self.toggle_recording();
                 }
                 ui.label("from");
@@ -914,8 +991,8 @@ impl eframe::App for App {
                 if picked {
                     self.start_download_if_missing();
                 }
-                ui.checkbox(&mut self.timestamps, "timestamps");
-                if ui.checkbox(&mut self.diarize, "speakers").changed() && self.diarize {
+                toggle(ui, &mut self.timestamps, "timestamps");
+                if toggle(ui, &mut self.diarize, "speakers").changed() && self.diarize {
                     self.start_diarization_download_if_missing();
                 }
                 if self.diarize {
@@ -1017,7 +1094,10 @@ impl eframe::App for App {
             );
         });
 
-        egui::Panel::bottom("status").frame(panel_frame).show(ui, |ui| {
+        let bottom_frame = card()
+            .inner_margin(egui::Margin::symmetric(14, 10))
+            .outer_margin(egui::Margin { left: 16, right: 16, top: 8, bottom: 16 });
+        egui::Panel::bottom("status").frame(bottom_frame).show(ui, |ui| {
             // Transcribe sits bottom-right; the status fills the space left of it.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let can_start = self.source.is_some()
@@ -1025,16 +1105,24 @@ impl eframe::App for App {
                     && self.download.is_none()
                     && self.model_path().is_some_and(|p| p.exists())
                     && (!self.diarize || self.diarization_models_ready());
-                if ui.add_enabled(can_start, egui::Button::new("Transcribe")).clicked() {
+                // Violet only when actionable — a filled fill() would
+                // otherwise override the disabled look.
+                let transcribe = if can_start {
+                    primary_button("Transcribe".into())
+                } else {
+                    egui::Button::new("Transcribe")
+                };
+                if ui.add_enabled(can_start, transcribe).clicked() {
                     self.start_transcription();
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     match (&running, &downloading) {
                         (Some((status, percent, remaining)), _) => {
-                            ui.spinner();
+                            ui.add(egui::Spinner::new().color(ACCENT));
                             ui.label(status);
                             if let Some(percent) = percent {
-                                let mut bar = egui::ProgressBar::new(*percent as f32 / 100.0);
+                                let mut bar =
+                                    egui::ProgressBar::new(*percent as f32 / 100.0).fill(ACCENT);
                                 bar = match remaining {
                                     Some(eta) => bar.text(format!("{percent}% — {eta}")),
                                     None => bar.show_percentage(),
@@ -1043,10 +1131,10 @@ impl eframe::App for App {
                             }
                         }
                         (None, Some((status, fraction, remaining))) => {
-                            ui.spinner();
+                            ui.add(egui::Spinner::new().color(ACCENT));
                             ui.label(status);
                             if let Some(fraction) = fraction {
-                                let mut bar = egui::ProgressBar::new(*fraction);
+                                let mut bar = egui::ProgressBar::new(*fraction).fill(ACCENT);
                                 bar = match remaining {
                                     Some(eta) => {
                                         bar.text(format!("{:.0}% — {eta}", fraction * 100.0))
@@ -1068,17 +1156,19 @@ impl eframe::App for App {
             });
         });
 
-        let central_frame = egui::Frame::central_panel(ui.style())
-            .inner_margin(egui::Margin::symmetric(16, 12));
+        let central_frame =
+            card().outer_margin(egui::Margin { left: 16, right: 16, top: 4, bottom: 4 });
         egui::CentralPanel::default().frame(central_frame).show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
                 .stick_to_bottom(running.is_some())
                 .show(ui, |ui| {
+                    // Frameless, so the transcript sits directly on the card.
                     ui.add_sized(
                         ui.available_size(),
                         egui::TextEdit::multiline(&mut self.transcript)
                             .font(egui::TextStyle::Monospace)
+                            .frame(egui::Frame::NONE)
                             .hint_text("transcript appears here"),
                     );
                 });
@@ -1122,7 +1212,7 @@ impl eframe::App for App {
             .show(ui.ctx(), |ui| {
                 ui.horizontal(|ui| {
                     if summarizing {
-                        ui.spinner();
+                        ui.add(egui::Spinner::new().color(ACCENT));
                         ui.label("summarizing ...");
                     } else if ui
                         .add_enabled(
@@ -1190,7 +1280,7 @@ impl eframe::App for App {
                 if !models_ready {
                     ui.horizontal(|ui| {
                         if self.download.is_some() {
-                            ui.spinner();
+                            ui.add(egui::Spinner::new().color(ACCENT));
                             ui.label("downloading ...");
                         } else if ui
                             .button(format!(
@@ -1228,11 +1318,12 @@ impl eframe::App for App {
                         Some(recorder) => {
                             ui.add(
                                 egui::ProgressBar::new((recorder.level() * 4.0).min(1.0))
-                                    .desired_width(60.0),
+                                    .desired_width(60.0)
+                                    .fill(GREEN),
                             );
                             ui.monospace(format_mmss(recorder.duration_secs()));
                             if ui
-                                .button(format!("{STOP} Stop & enroll"))
+                                .add(filled_button(format!("{STOP} Stop & enroll"), RED))
                                 .clicked()
                             {
                                 self.toggle_enrollment();
@@ -1242,7 +1333,7 @@ impl eframe::App for App {
                 });
                 ui.horizontal(|ui| {
                     if enrolling {
-                        ui.spinner();
+                        ui.add(egui::Spinner::new().color(ACCENT));
                         ui.label("enrolling from file ...");
                     } else {
                         let button =
@@ -1291,11 +1382,12 @@ impl eframe::App for App {
                     });
                 }
                 ui.add_space(4.0);
-                ui.checkbox(
+                toggle(
+                    ui,
                     &mut self.enroll_on_rename,
                     "also enroll these voices for future transcripts",
                 );
-                if ui.button(format!("{CHECK} Apply")).clicked() {
+                if ui.add(primary_button(format!("{CHECK} Apply"))).clicked() {
                     let mut renamed = 0;
                     for (voice, input) in
                         self.speaker_voices.iter_mut().zip(&mut self.rename_inputs)
