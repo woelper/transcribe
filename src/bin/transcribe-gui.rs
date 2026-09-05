@@ -896,7 +896,31 @@ impl eframe::App for App {
             .frame(top_frame)
             .show_separator_line(false)
             .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            // One row: record from a device, or open a file; then what's loaded.
+            ui.horizontal_wrapped(|ui| {
+                let record_button = if recording {
+                    filled_button(format!("{STOP} Stop"), RED)
+                } else {
+                    egui::Button::new(format!("{RECORD} Record"))
+                };
+                let can_record = running.is_none() && self.enroll_recorder.is_none();
+                if ui.add_enabled(can_record, record_button).clicked() {
+                    self.toggle_recording();
+                }
+                ui.label("from");
+                let selected = self.device.clone().unwrap_or_else(|| "default input".into());
+                egui::ComboBox::from_id_salt("device")
+                    .selected_text(selected)
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.device, None, "default input");
+                        for name in &self.devices {
+                            ui.selectable_value(&mut self.device, Some(name.clone()), name);
+                        }
+                    });
+                if ui.button(ARROWS_CLOCKWISE).on_hover_text("refresh device list").clicked() {
+                    self.devices = recorder::input_devices();
+                }
                 if ui
                     .add_enabled(!busy, egui::Button::new(format!("{FOLDER_OPEN} Open audio…")))
                     .clicked()
@@ -938,31 +962,6 @@ impl eframe::App for App {
                         ui.weak("no audio loaded");
                     }
                 };
-            });
-            ui.horizontal(|ui| {
-                let record_button = if recording {
-                    filled_button(format!("{STOP} Stop"), RED)
-                } else {
-                    egui::Button::new(format!("{RECORD} Record"))
-                };
-                let can_record = running.is_none() && self.enroll_recorder.is_none();
-                if ui.add_enabled(can_record, record_button).clicked() {
-                    self.toggle_recording();
-                }
-                ui.label("from");
-                let selected = self.device.clone().unwrap_or_else(|| "default input".into());
-                egui::ComboBox::from_id_salt("device")
-                    .selected_text(selected)
-                    .width(220.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.device, None, "default input");
-                        for name in &self.devices {
-                            ui.selectable_value(&mut self.device, Some(name.clone()), name);
-                        }
-                    });
-                if ui.button(ARROWS_CLOCKWISE).on_hover_text("refresh device list").clicked() {
-                    self.devices = recorder::input_devices();
-                }
             });
             ui.horizontal_wrapped(|ui| {
                 let labels: Vec<(String, String)> = WHISPER_MODELS
