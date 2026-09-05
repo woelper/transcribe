@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eframe::egui;
-use egui_phosphor::regular::{
+use egui_phosphor::fill::{
     ARROWS_CLOCKWISE, BOOK_OPEN, CHECK, COPY, DOWNLOAD_SIMPLE, FLOPPY_DISK, FOLDER_OPEN,
     LIST_BULLETS, MICROPHONE, NOTE_PENCIL, RECORD, STOP, TRASH, USERS, WARNING,
 };
@@ -54,7 +54,6 @@ const CARD: egui::Color32 = egui::Color32::WHITE;
 const FIELD: egui::Color32 = egui::Color32::from_rgb(0xf3, 0xf4, 0xfa);
 const BUTTON: egui::Color32 = egui::Color32::from_rgb(0xec, 0xee, 0xf6);
 const BUTTON_HOVER: egui::Color32 = egui::Color32::from_rgb(0xe1, 0xe4, 0xf1);
-const HAIRLINE: egui::Color32 = egui::Color32::from_rgb(0xe6, 0xe8, 0xf2);
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x6c, 0x5c, 0xe7);
 const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(0xe9, 0xe6, 0xfb);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(0x2b, 0xd8, 0x8f);
@@ -147,7 +146,14 @@ fn setup_theme(ctx: &egui::Context) {
         FontFamily::Name("plex-medium".into()),
         vec!["plex-sans-medium".into(), "plex-sans".into()],
     );
-    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Fill);
+    // add_to_fonts only extends the built-in families; the medium family
+    // (filled buttons) needs the icon font too or "{STOP} Stop" shows "?".
+    fonts
+        .families
+        .get_mut(&FontFamily::Name("plex-medium".into()))
+        .unwrap()
+        .push("phosphor".into());
     ctx.set_fonts(fonts);
 
     ctx.set_theme(egui::ThemePreference::Light);
@@ -168,7 +174,7 @@ fn setup_theme(ctx: &egui::Context) {
     v.override_text_color = Some(TEXT);
     v.panel_fill = GROUND;
     v.window_fill = CARD;
-    v.window_stroke = Stroke::new(1.0, HAIRLINE);
+    v.window_stroke = Stroke::NONE;
     v.window_corner_radius = CornerRadius::same(16);
     v.window_shadow = Shadow { offset: [0, 8], blur: 32, spread: 0, color: SHADOW };
     v.popup_shadow = Shadow { offset: [0, 4], blur: 16, spread: 0, color: SHADOW };
@@ -188,7 +194,7 @@ fn setup_theme(ctx: &egui::Context) {
         w.expansion = 0.0;
     }
     v.widgets.noninteractive.corner_radius = CornerRadius::same(12);
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, HAIRLINE);
+    v.widgets.noninteractive.bg_stroke = Stroke::NONE; // no separators/outlines
     v.widgets.inactive.weak_bg_fill = BUTTON;
     v.widgets.inactive.bg_fill = BUTTON;
     v.widgets.hovered.weak_bg_fill = BUTTON_HOVER;
@@ -859,6 +865,9 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Painted here too (not only via clear_color) so off-screen renders
+        // such as the snapshot test show the ground instead of transparency.
+        ui.painter().rect_filled(ui.ctx().content_rect(), 0.0, GROUND);
         let running = self.poll_job();
         let downloading = self.poll_download();
         let enrolling = self.poll_enrollment();
@@ -880,11 +889,13 @@ impl eframe::App for App {
         let recording = self.recorder.is_some();
         let busy = running.is_some() || recording;
 
-        // Each panel is a white card floating on the lavender ground; the
-        // ground itself is painted by clear_color() below.
+        // Each panel is a white card floating on the lavender ground.
         let top_frame =
             card().outer_margin(egui::Margin { left: 16, right: 16, top: 16, bottom: 10 });
-        egui::Panel::top("controls").frame(top_frame).show(ui, |ui| {
+        egui::Panel::top("controls")
+            .frame(top_frame)
+            .show_separator_line(false)
+            .show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(!busy, egui::Button::new(format!("{FOLDER_OPEN} Open audio…")))
@@ -1097,7 +1108,10 @@ impl eframe::App for App {
         let bottom_frame = card()
             .inner_margin(egui::Margin::symmetric(14, 10))
             .outer_margin(egui::Margin { left: 16, right: 16, top: 10, bottom: 16 });
-        egui::Panel::bottom("status").frame(bottom_frame).show(ui, |ui| {
+        egui::Panel::bottom("status")
+            .frame(bottom_frame)
+            .show_separator_line(false)
+            .show(ui, |ui| {
             // Transcribe sits bottom-right; the status fills the space left of it.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let can_start = self.source.is_some()
@@ -1271,8 +1285,7 @@ impl eframe::App for App {
                     ui.weak("no voices enrolled yet");
                 }
 
-                ui.add_space(6.0);
-                ui.separator();
+                ui.add_space(12.0);
                 ui.label("Enroll a new voice — enter the name, then record \
                     ~10 seconds of them speaking, or pick a recording where \
                     only they speak (optionally a time range of it):");
