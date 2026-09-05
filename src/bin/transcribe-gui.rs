@@ -1070,28 +1070,6 @@ impl eframe::App for App {
                 {
                     self.start_summarization();
                 }
-                let can_save = !self.transcript.is_empty() && !busy;
-                if ui
-                    .add_enabled(can_save, egui::Button::new(format!("{FLOPPY_DISK} Save transcript…")))
-                    .clicked()
-                {
-                    let name = match &self.source {
-                        Some(Source::File(path)) => path
-                            .file_stem()
-                            .map_or("transcript".into(), |s| s.to_string_lossy().into_owned()),
-                        _ => "transcript".into(),
-                    };
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_file_name(format!("{name}.txt"))
-                        .add_filter("text", &["txt"])
-                        .save_file()
-                    {
-                        self.status = match std::fs::write(&path, &self.transcript) {
-                            Ok(()) => format!("saved to {}", path.display()),
-                            Err(e) => format!("error: failed to save: {e}"),
-                        };
-                    }
-                }
             });
             ui.add(
                 egui::TextEdit::multiline(&mut self.context)
@@ -1127,6 +1105,29 @@ impl eframe::App for App {
                 };
                 if ui.add_enabled(can_start, transcribe).clicked() {
                     self.start_transcription();
+                }
+                // Only once there is something to save.
+                if !self.transcript.is_empty()
+                    && ui
+                        .add_enabled(!busy, egui::Button::new(format!("{FLOPPY_DISK} Save transcript…")))
+                        .clicked()
+                {
+                    let name = match &self.source {
+                        Some(Source::File(path)) => path
+                            .file_stem()
+                            .map_or("transcript".into(), |s| s.to_string_lossy().into_owned()),
+                        _ => "transcript".into(),
+                    };
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name(format!("{name}.txt"))
+                        .add_filter("text", &["txt"])
+                        .save_file()
+                    {
+                        self.status = match std::fs::write(&path, &self.transcript) {
+                            Ok(()) => format!("saved to {}", path.display()),
+                            Err(e) => format!("error: failed to save: {e}"),
+                        };
+                    }
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     match (&running, &downloading) {
