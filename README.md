@@ -1,6 +1,6 @@
 # Transcribe
 
-![Transcribe](tests/snapshots/transcribe-gui.png)
+![Transcribe](assets/screenshot.png)
 
 Local, offline speech-to-text for meetings and recordings. Built on
 [whisper.cpp](https://github.com/ggerganov/whisper.cpp) with Metal GPU

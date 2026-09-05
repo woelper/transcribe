@@ -4425,6 +4425,7 @@ dependencies = [
  "eframe",
  "egui-phosphor",
  "egui_kittest",
+ "image",
  "llama-cpp-2",
  "ndarray",
  "ort",

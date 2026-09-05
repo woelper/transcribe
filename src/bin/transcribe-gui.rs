@@ -1533,9 +1533,10 @@ mod tests {
     use super::parse_time;
 
     /// Renders the main view off-screen and stores it under
-    /// tests/snapshots/ — both a regression check and an always-current
-    /// screenshot of the UI. Ignored by default because it needs a GPU
-    /// (or a software Vulkan driver such as lavapipe); run with
+    /// tests/snapshots/ as a regression check, then dresses the same render
+    /// up with window chrome and a drop shadow as assets/screenshot.png for
+    /// the README. Ignored by default because it needs a GPU (or a
+    /// software Vulkan driver such as lavapipe); run with
     /// `cargo test --bin transcribe-gui -- --ignored`, and set
     /// UPDATE_SNAPSHOTS=force to regenerate the baseline image.
     #[test]
@@ -1566,6 +1567,85 @@ mod tests {
             });
         harness.run();
         harness.snapshot("transcribe-gui");
+
+        let app = harness.render().unwrap();
+        let chrome = render_window_chrome(app.width() as f32);
+        readme_screenshot(&chrome, &app).save("assets/screenshot.png").unwrap();
+    }
+
+    /// A macOS-style title bar (traffic lights, centered title) on the
+    /// app's ground color, rendered with the app's own fonts.
+    fn render_window_chrome(width: f32) -> image::RgbaImage {
+        use egui::{Align2, FontFamily, FontId, pos2, vec2};
+
+        const HEIGHT: f32 = 44.0;
+        let mut themed = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(vec2(width, HEIGHT))
+            .with_theme(egui::Theme::Light)
+            .build_ui(move |ui| {
+                if !themed {
+                    // Fonts apply from the next frame on; run() repeats.
+                    super::setup_theme(ui.ctx());
+                    themed = true;
+                    return;
+                }
+                let rect = ui.ctx().content_rect();
+                let painter = ui.painter();
+                painter.rect_filled(rect, 0.0, super::GROUND);
+                let lights = [(0xff, 0x5f, 0x57), (0xfe, 0xbc, 0x2e), (0x28, 0xc8, 0x40)];
+                for (i, (r, g, b)) in lights.into_iter().enumerate() {
+                    let center = pos2(rect.left() + 20.0 + 20.0 * i as f32, rect.center().y);
+                    painter.circle_filled(center, 6.0, egui::Color32::from_rgb(r, g, b));
+                }
+                painter.text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    "Transcribe",
+                    FontId::new(13.0, FontFamily::Name("plex-medium".into())),
+                    super::TEXT,
+                );
+            });
+        harness.run();
+        harness.render().unwrap()
+    }
+
+    /// Stacks chrome over the app render, rounds the window corners, and
+    /// floats it on a transparent canvas with a soft drop shadow.
+    fn readme_screenshot(chrome: &image::RgbaImage, app: &image::RgbaImage) -> image::RgbaImage {
+        use image::{Rgba, RgbaImage, imageops};
+
+        const RADIUS: f32 = 12.0;
+        const MARGIN: u32 = 48;
+        const SHADOW_OFFSET: u32 = 14;
+        const SHADOW_BLUR: f32 = 14.0;
+        const SHADOW_ALPHA: f32 = 0.4;
+
+        let (w, h) = (app.width(), chrome.height() + app.height());
+        let mut window = RgbaImage::new(w, h);
+        imageops::overlay(&mut window, chrome, 0, 0);
+        imageops::overlay(&mut window, app, 0, chrome.height() as i64);
+
+        // Anti-aliased rounded corners: coverage falls off across the
+        // pixel that straddles the corner arc.
+        let (fw, fh) = (w as f32, h as f32);
+        for (x, y, pixel) in window.enumerate_pixels_mut() {
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+            let cx = px.clamp(RADIUS, fw - RADIUS);
+            let cy = py.clamp(RADIUS, fh - RADIUS);
+            let distance = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() - RADIUS;
+            let coverage = (0.5 - distance).clamp(0.0, 1.0);
+            pixel[3] = (pixel[3] as f32 * coverage).round() as u8;
+        }
+
+        let mut shadow = RgbaImage::from_pixel(w + 2 * MARGIN, h + 2 * MARGIN, Rgba([0, 0, 0, 0]));
+        for (x, y, pixel) in window.enumerate_pixels() {
+            let alpha = (pixel[3] as f32 * SHADOW_ALPHA).round() as u8;
+            shadow.put_pixel(x + MARGIN, y + MARGIN + SHADOW_OFFSET, Rgba([0, 0, 0, alpha]));
+        }
+        let mut canvas = imageops::blur(&shadow, SHADOW_BLUR);
+        imageops::overlay(&mut canvas, &window, MARGIN as i64, MARGIN as i64);
+        canvas
     }
 
     #[test]

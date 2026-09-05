@@ -24,6 +24,8 @@ ureq = "3.3.0"
 # Headless UI screenshot test (see `ui_screenshot` in transcribe-gui):
 # renders the app off-screen via wgpu and writes tests/snapshots/*.png.
 egui_kittest = { version = "0.35", features = ["eframe", "snapshot", "wgpu"] }
+# Same version egui_kittest renders into; composes the README screenshot.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Metal GPU acceleration exists only on Apple platforms; other targets
 # build whisper.cpp/llama.cpp for CPU.
