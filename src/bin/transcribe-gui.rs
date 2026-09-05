@@ -60,7 +60,7 @@ const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(0xe9, 0xe6, 0xfb);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(0x2b, 0xd8, 0x8f);
 const RED: egui::Color32 = egui::Color32::from_rgb(0xef, 0x50, 0x6e);
 const TRACK_OFF: egui::Color32 = egui::Color32::from_rgb(0xd8, 0xdb, 0xe8);
-const SHADOW: egui::Color32 = egui::Color32::from_rgba_premultiplied(9, 10, 14, 30);
+const SHADOW: egui::Color32 = egui::Color32::from_rgba_premultiplied(5, 5, 8, 16);
 
 /// White rounded card with a soft drop shadow — the base surface every
 /// panel and window sits on.
@@ -68,7 +68,7 @@ fn card() -> egui::Frame {
     egui::Frame::new()
         .fill(CARD)
         .corner_radius(egui::CornerRadius::same(16))
-        .shadow(egui::Shadow { offset: [0, 2], blur: 10, spread: 0, color: SHADOW })
+        .shadow(egui::Shadow { offset: [0, 2], blur: 8, spread: 0, color: SHADOW })
         .inner_margin(egui::Margin::same(14))
 }
 
@@ -883,7 +883,7 @@ impl eframe::App for App {
         // Each panel is a white card floating on the lavender ground; the
         // ground itself is painted by clear_color() below.
         let top_frame =
-            card().outer_margin(egui::Margin { left: 16, right: 16, top: 16, bottom: 8 });
+            card().outer_margin(egui::Margin { left: 16, right: 16, top: 16, bottom: 10 });
         egui::Panel::top("controls").frame(top_frame).show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui
@@ -1096,7 +1096,7 @@ impl eframe::App for App {
 
         let bottom_frame = card()
             .inner_margin(egui::Margin::symmetric(14, 10))
-            .outer_margin(egui::Margin { left: 16, right: 16, top: 8, bottom: 16 });
+            .outer_margin(egui::Margin { left: 16, right: 16, top: 10, bottom: 16 });
         egui::Panel::bottom("status").frame(bottom_frame).show(ui, |ui| {
             // Transcribe sits bottom-right; the status fills the space left of it.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1157,7 +1157,7 @@ impl eframe::App for App {
         });
 
         let central_frame =
-            card().outer_margin(egui::Margin { left: 16, right: 16, top: 4, bottom: 4 });
+            card().outer_margin(egui::Margin { left: 16, right: 16, top: 6, bottom: 6 });
         egui::CentralPanel::default().frame(central_frame).show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
@@ -1515,7 +1515,45 @@ fn is_silent(samples: &[f32]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use eframe::egui;
+
     use super::parse_time;
+
+    /// Renders the main view off-screen and stores it under
+    /// tests/snapshots/ — both a regression check and an always-current
+    /// screenshot of the UI. Ignored by default because it needs a GPU
+    /// (or a software Vulkan driver such as lavapipe); run with
+    /// `cargo test --bin transcribe-gui -- --ignored`, and set
+    /// UPDATE_SNAPSHOTS=force to regenerate the baseline image.
+    #[test]
+    #[ignore = "needs a GPU; run with --ignored to check/update the UI snapshot"]
+    fn ui_screenshot() {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(860.0, 640.0))
+            // kittest defaults to dark and overrides the app's preference.
+            .with_theme(egui::Theme::Light)
+            .build_eframe(|cc| {
+                super::setup_theme(&cc.egui_ctx);
+                let mut app = super::App::new();
+                app.source = Some(super::Source::File("standup-2026-09-05.m4a".into()));
+                app.diarize = true;
+                app.context = "Weekly standup — Anna, Ben, Chris. Topics: \
+                    release 0.3, onboarding, GPU builds."
+                    .into();
+                app.transcript = "\
+                    Anna: Morning everyone, let's keep it short today.\n\
+                    Ben: Release 0.3 is tagged, the bundle script now signs the app.\n\
+                    Anna: Nice. Anything blocking the GPU builds?\n\
+                    Chris: The Metal path is fine, I'm still chasing the Vulkan validation warning.\n\
+                    Ben: I can pair on that after lunch.\n\
+                    Anna: Perfect. Onboarding doc review moves to Thursday then.\n"
+                    .into();
+                app.status = "done — 3 speaker(s) detected, recognized: Anna (0.84)".into();
+                app
+            });
+        harness.run();
+        harness.snapshot("transcribe-gui");
+    }
 
     #[test]
     fn parses_enrollment_time_ranges() {

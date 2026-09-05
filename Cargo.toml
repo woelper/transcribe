@@ -20,6 +20,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 symphonia = { version = "0.6.0", features = ["aac", "isomp4", "mp3"] }
 ureq = "3.3.0"
+[dev-dependencies]
+# Headless UI screenshot test (see `ui_screenshot` in transcribe-gui):
+# renders the app off-screen via wgpu and writes tests/snapshots/*.png.
+egui_kittest = { version = "0.35", features = ["eframe", "snapshot", "wgpu"] }
+
 # Metal GPU acceleration exists only on Apple platforms; other targets
 # build whisper.cpp/llama.cpp for CPU.
 [target.'cfg(target_os = "macos")'.dependencies]
