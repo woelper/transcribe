@@ -71,6 +71,15 @@ fn card() -> egui::Frame {
         .inner_margin(egui::Margin::same(14))
 }
 
+/// Corner radius shared by buttons, fields, and progress bars.
+const WIDGET_RADIUS: u8 = 12;
+
+/// Progress bar with the same rounding as the buttons (egui's default is
+/// a pill).
+fn progress_bar(fraction: f32) -> egui::ProgressBar {
+    egui::ProgressBar::new(fraction).corner_radius(egui::CornerRadius::same(WIDGET_RADIUS))
+}
+
 /// Solid filled button with white text, for accented actions.
 fn filled_button(text: String, fill: egui::Color32) -> egui::Button<'static> {
     egui::Button::new(
@@ -189,11 +198,11 @@ fn setup_theme(ctx: &egui::Context) {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.corner_radius = CornerRadius::same(12);
+        w.corner_radius = CornerRadius::same(WIDGET_RADIUS);
         w.bg_stroke = Stroke::NONE;
         w.expansion = 0.0;
     }
-    v.widgets.noninteractive.corner_radius = CornerRadius::same(12);
+    v.widgets.noninteractive.corner_radius = CornerRadius::same(WIDGET_RADIUS);
     v.widgets.noninteractive.bg_stroke = Stroke::NONE; // no separators/outlines
     v.widgets.inactive.weak_bg_fill = BUTTON;
     v.widgets.inactive.bg_fill = BUTTON;
@@ -946,7 +955,7 @@ impl eframe::App for App {
                         // permission, unrouted loopback) is visible immediately.
                         let level = recorder.level();
                         ui.add(
-                            egui::ProgressBar::new((level * 4.0).min(1.0))
+                            progress_bar((level * 4.0).min(1.0))
                                 .desired_width(80.0)
                                 .fill(GREEN),
                         )
@@ -1136,7 +1145,7 @@ impl eframe::App for App {
                             ui.label(status);
                             if let Some(percent) = percent {
                                 let mut bar =
-                                    egui::ProgressBar::new(*percent as f32 / 100.0).fill(ACCENT);
+                                    progress_bar(*percent as f32 / 100.0).fill(ACCENT);
                                 bar = match remaining {
                                     Some(eta) => bar.text(format!("{percent}% — {eta}")),
                                     None => bar.show_percentage(),
@@ -1148,7 +1157,7 @@ impl eframe::App for App {
                             ui.add(egui::Spinner::new().color(ACCENT));
                             ui.label(status);
                             if let Some(fraction) = fraction {
-                                let mut bar = egui::ProgressBar::new(*fraction).fill(ACCENT);
+                                let mut bar = progress_bar(*fraction).fill(ACCENT);
                                 bar = match remaining {
                                     Some(eta) => {
                                         bar.text(format!("{:.0}% — {eta}", fraction * 100.0))
@@ -1330,7 +1339,7 @@ impl eframe::App for App {
                         }
                         Some(recorder) => {
                             ui.add(
-                                egui::ProgressBar::new((recorder.level() * 4.0).min(1.0))
+                                progress_bar((recorder.level() * 4.0).min(1.0))
                                     .desired_width(60.0)
                                     .fill(GREEN),
                             );
