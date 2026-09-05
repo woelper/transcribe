@@ -1084,6 +1084,8 @@ impl eframe::App for App {
                 egui::TextEdit::multiline(&mut self.context)
                     .desired_rows(2)
                     .desired_width(f32::INFINITY)
+                    // Same breathing room as the transcript card.
+                    .margin(egui::Margin::symmetric(14, 12))
                     .hint_text(
                         "context for this recording — meeting name, speakers, topics, notes \
                          (sent to the transcription along with the vocabulary)",
