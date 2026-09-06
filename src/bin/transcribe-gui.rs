@@ -59,11 +59,13 @@ const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(0xe9, 0xe6, 0xfb);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(0x2b, 0xd8, 0x8f);
 const RED: egui::Color32 = egui::Color32::from_rgb(0xef, 0x50, 0x6e);
 const TRACK_OFF: egui::Color32 = egui::Color32::from_rgb(0xd8, 0xdb, 0xe8);
-/// Faint outline for the model picker.
+/// Faint outline on buttons and dropdowns.
 const FRAME: egui::Color32 = egui::Color32::from_rgb(0xdd, 0xe0, 0xec);
 /// Memory bar in the model picker.
 const MEMORY: egui::Color32 = egui::Color32::from_rgb(0xf5, 0xa6, 0x23);
 const SHADOW: egui::Color32 = egui::Color32::from_rgba_premultiplied(5, 5, 8, 16);
+/// Popups float above cards, so they need a deeper shadow than the cards.
+const POPUP_SHADOW: egui::Color32 = egui::Color32::from_rgba_premultiplied(8, 8, 14, 64);
 
 /// White rounded card with a soft drop shadow — the base surface every
 /// panel and window sits on.
@@ -191,6 +193,7 @@ fn filled_button(text: String, fill: egui::Color32) -> egui::Button<'static> {
             .family(egui::FontFamily::Name("plex-medium".into())),
     )
     .fill(fill)
+    .stroke(egui::Stroke::NONE)
 }
 
 /// Violet button for the one action that matters in a view.
@@ -289,7 +292,7 @@ fn setup_theme(ctx: &egui::Context) {
     v.window_stroke = Stroke::NONE;
     v.window_corner_radius = CornerRadius::same(16);
     v.window_shadow = Shadow { offset: [0, 8], blur: 32, spread: 0, color: SHADOW };
-    v.popup_shadow = Shadow { offset: [0, 4], blur: 16, spread: 0, color: SHADOW };
+    v.popup_shadow = Shadow { offset: [0, 8], blur: 28, spread: 0, color: POPUP_SHADOW };
     v.extreme_bg_color = FIELD; // text-edit backgrounds, progress troughs
     v.faint_bg_color = FIELD;
     v.selection.bg_fill = ACCENT_SOFT;
@@ -302,7 +305,7 @@ fn setup_theme(ctx: &egui::Context) {
         &mut v.widgets.open,
     ] {
         w.corner_radius = CornerRadius::same(WIDGET_RADIUS);
-        w.bg_stroke = Stroke::NONE;
+        w.bg_stroke = Stroke::new(1.0, FRAME); // faint outline on every button
         w.expansion = 0.0;
     }
     v.widgets.noninteractive.corner_radius = CornerRadius::same(WIDGET_RADIUS);
@@ -1089,33 +1092,27 @@ impl eframe::App for App {
                 let model_enabled =
                     self.models_dir.is_some() && running.is_none() && self.download.is_none();
                 let mut picked = false;
-                // A faint frame sets the model picker apart from the plain buttons.
-                egui::Frame::new()
-                    .stroke(egui::Stroke::new(1.0, FRAME))
-                    .corner_radius(egui::CornerRadius::same(WIDGET_RADIUS))
-                    .show(ui, |ui| {
-                        ui.add_enabled_ui(model_enabled, |ui| {
-                            egui::ComboBox::from_id_salt("model")
-                                .selected_text(&self.model)
-                                .width(230.0)
-                                // Tall enough for every model without scrolling.
-                                .height(600.0)
-                                .show_ui(ui, |ui| {
-                                    ui.spacing_mut().item_spacing.y = 2.0;
-                                    model_rows_header(ui);
-                                    for m in SPEECH_MODELS {
-                                        let installed = self
-                                            .models_dir
-                                            .as_ref()
-                                            .is_some_and(|dir| dir.join(m.file).exists());
-                                        if model_row(ui, m, self.model == m.name, installed).clicked() {
-                                            self.model = m.name.to_owned();
-                                            picked = true;
-                                        }
-                                    }
-                                });
+                ui.add_enabled_ui(model_enabled, |ui| {
+                    egui::ComboBox::from_id_salt("model")
+                        .selected_text(&self.model)
+                        .width(230.0)
+                        // Tall enough for every model without scrolling.
+                        .height(600.0)
+                        .show_ui(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            model_rows_header(ui);
+                            for m in SPEECH_MODELS {
+                                let installed = self
+                                    .models_dir
+                                    .as_ref()
+                                    .is_some_and(|dir| dir.join(m.file).exists());
+                                if model_row(ui, m, self.model == m.name, installed).clicked() {
+                                    self.model = m.name.to_owned();
+                                    picked = true;
+                                }
+                            }
                         });
-                    });
+                });
                 if picked {
                     self.start_download_if_missing();
                 }
@@ -1766,6 +1763,38 @@ mod tests {
         let mut canvas = imageops::blur(&shadow, SHADOW_BLUR);
         imageops::overlay(&mut canvas, &window, MARGIN as i64, MARGIN as i64);
         canvas
+    }
+
+    /// The model picker opened, so its rows and bars are checked too.
+    #[test]
+    #[ignore = "needs a GPU; run with --ignored to check/update the UI snapshot"]
+    fn ui_screenshot_model_picker() {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(860.0, 640.0))
+            .with_theme(egui::Theme::Light)
+            .build_eframe(|cc| {
+                super::setup_theme(&cc.egui_ctx);
+                let mut app = super::App::new();
+                app.source = Some(super::Source::File("standup-2026-09-05.m4a".into()));
+                app
+            });
+        harness.run();
+        // Click the model dropdown (second row, left), then move the
+        // pointer off the list so no row shows a hover highlight.
+        let dropdown = egui::pos2(145.0, 91.0);
+        for pressed in [true, false] {
+            harness.input_mut().events.push(egui::Event::PointerMoved(dropdown));
+            harness.input_mut().events.push(egui::Event::PointerButton {
+                pos: dropdown,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            });
+            harness.run();
+        }
+        harness.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(700.0, 400.0)));
+        harness.run();
+        harness.snapshot("transcribe-gui-model-picker");
     }
 
     #[test]
