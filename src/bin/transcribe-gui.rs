@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use transcribe::download::{
     VAD_MODEL_URL, SPEECH_MODELS, model_by_name,
 };
 use transcribe::recorder::{self, Recorder};
-use transcribe::{DiarizeModels, Options, Progress, SpeakerVoice, Transcript};
+use transcribe::{DiarizeModels, Engine, Options, Progress, SpeakerVoice, Transcript};
 
 const DEFAULT_MODEL: &str = "large-v3-turbo";
 
@@ -559,6 +559,13 @@ impl App {
         self.models_dir.as_ref().map(|dir| dir.join(model.file))
     }
 
+    /// Whether the selected model takes the vocabulary/context prompt
+    /// (only Whisper does).
+    fn prompt_supported(&self) -> bool {
+        model_by_name(&self.model)
+            .is_none_or(|m| Engine::for_model(Path::new(m.file)) == Engine::Whisper)
+    }
+
     /// Fetch `url` into `path` in the background, shown in the status bar
     /// as `what`. Only one download runs at a time.
     fn start_file_download(&mut self, what: String, url: String, path: PathBuf) {
@@ -1088,6 +1095,12 @@ impl eframe::App for App {
                     }
                 };
             });
+            let prompt_supported = self.prompt_supported();
+            let no_prompt_reason = format!(
+                "{} takes no prompt, so vocabulary and context are ignored — \
+                 they only apply to Whisper models",
+                self.model
+            );
             ui.horizontal_wrapped(|ui| {
                 let model_enabled =
                     self.models_dir.is_some() && running.is_none() && self.download.is_none();
@@ -1139,8 +1152,9 @@ impl eframe::App for App {
                         );
                 }
                 if ui
-                    .button(format!("{BOOK_OPEN} Vocabulary…"))
-                    .on_hover_text("terms Whisper should spell correctly — product names, people, acronyms (Whisper models only)")
+                    .add_enabled(prompt_supported, egui::Button::new(format!("{BOOK_OPEN} Vocabulary…")))
+                    .on_hover_text("terms Whisper should spell correctly — product names, people, acronyms")
+                    .on_disabled_hover_text(&no_prompt_reason)
                     .clicked()
                 {
                     self.show_vocabulary = !self.show_vocabulary;
@@ -1186,17 +1200,23 @@ impl eframe::App for App {
                     self.start_summarization();
                 }
             });
-            ui.add(
+            let context_hint = if prompt_supported {
+                "context for this recording — meeting name, speakers, topics, notes \
+                 (sent to Whisper along with the vocabulary)"
+                    .to_owned()
+            } else {
+                no_prompt_reason.clone()
+            };
+            ui.add_enabled(
+                prompt_supported,
                 egui::TextEdit::multiline(&mut self.context)
                     .desired_rows(2)
                     .desired_width(f32::INFINITY)
                     // Same breathing room as the transcript card.
                     .margin(egui::Margin::symmetric(14, 12))
-                    .hint_text(
-                        "context for this recording — meeting name, speakers, topics, notes \
-                         (sent to Whisper models along with the vocabulary)",
-                    ),
-            );
+                    .hint_text(context_hint),
+            )
+            .on_disabled_hover_text(&no_prompt_reason);
         });
 
         let bottom_frame = card()
