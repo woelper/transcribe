@@ -326,6 +326,13 @@ fn setup_theme(ctx: &egui::Context) {
     ctx.set_style_of(egui::Theme::Light, style);
 }
 
+/// An action that would throw away the current, untranscribed recording.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Discard {
+    Record,
+    OpenFile,
+}
+
 /// What gets transcribed: a loaded file or an in-memory recording.
 enum Source {
     File(PathBuf),
@@ -408,6 +415,13 @@ struct App {
     /// Summarize was clicked before the summary model was on disk; start
     /// summarizing as soon as its download finishes.
     summarize_pending: bool,
+    /// Whether the current source has been transcribed. A recording that
+    /// hasn't been would be lost by recording or opening something else,
+    /// so those ask first.
+    source_transcribed: bool,
+    /// Which action is waiting for the user to confirm discarding an
+    /// untranscribed recording.
+    confirm_discard: Option<Discard>,
 }
 
 /// A file-based enrollment running in a background thread (decoding and
@@ -476,6 +490,8 @@ impl App {
             show_summary: false,
             summary_job: None,
             summarize_pending: false,
+            source_transcribed: false,
+            confirm_discard: None,
         }
     }
 
@@ -861,6 +877,7 @@ impl App {
         let mut job = job.lock().unwrap();
         match job.result.take() {
             Some(Ok(transcript)) => {
+                self.source_transcribed = true;
                 self.transcript = transcript.text;
                 self.speaker_voices = transcript.speaker_voices;
                 self.rename_inputs = vec![String::new(); self.speaker_voices.len()];
@@ -955,6 +972,65 @@ impl App {
         }
     }
 
+    /// A recording sits in memory and nothing has been transcribed from it
+    /// yet — recording or opening something else would lose it.
+    fn has_untranscribed_recording(&self) -> bool {
+        matches!(self.source, Some(Source::Recording { .. })) && !self.source_transcribed
+    }
+
+    /// Pick an audio file and make it the source.
+    fn open_audio_file(&mut self) {
+        if let Some(file) = rfd::FileDialog::new()
+            .add_filter("audio", &["mp3", "m4a", "mp4", "wav", "flac", "ogg"])
+            .pick_file()
+        {
+            self.source = Some(Source::File(file));
+            self.source_transcribed = false;
+            self.transcript.clear();
+            self.status.clear();
+        }
+    }
+
+    /// Modal asking whether to throw away the untranscribed recording.
+    fn show_discard_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.confirm_discard else { return };
+        let secs = match &self.source {
+            Some(Source::Recording { secs, .. }) => *secs,
+            _ => 0.0,
+        };
+        let (verb, confirm) = match action {
+            Discard::Record => ("Starting a new recording", format!("{RECORD} Record anyway")),
+            Discard::OpenFile => ("Opening a file", format!("{FOLDER_OPEN} Open anyway")),
+        };
+        let modal = egui::Modal::new(egui::Id::new("discard-recording"))
+            .frame(card().inner_margin(egui::Margin::same(20)))
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.heading(format!("{WARNING} Discard the current recording?"));
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "The {} recording hasn't been transcribed yet. {verb} throws it away.",
+                    format_mmss(secs)
+                ));
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(filled_button(confirm, RED)).clicked() {
+                        self.confirm_discard = None;
+                        match action {
+                            Discard::Record => self.toggle_recording(),
+                            Discard::OpenFile => self.open_audio_file(),
+                        }
+                    }
+                    if ui.button("Keep it").clicked() {
+                        self.confirm_discard = None;
+                    }
+                });
+            });
+        if modal.should_close() {
+            self.confirm_discard = None;
+        }
+    }
+
     fn toggle_recording(&mut self) {
         match self.recorder.take() {
             None if !mic_usage_declared() => {
@@ -985,6 +1061,7 @@ impl App {
                             samples: Arc::new(samples),
                             secs,
                         });
+                        self.source_transcribed = false;
                         self.status = format!("recorded {}", format_mmss(secs));
                     }
                     Err(e) => self.status = format!("error: {e:#}"),
@@ -1041,7 +1118,11 @@ impl eframe::App for App {
                 };
                 let can_record = running.is_none() && self.enroll_recorder.is_none();
                 if ui.add_enabled(can_record, record_button).clicked() {
-                    self.toggle_recording();
+                    if self.has_untranscribed_recording() {
+                        self.confirm_discard = Some(Discard::Record);
+                    } else {
+                        self.toggle_recording();
+                    }
                 }
                 ui.label("from");
                 let selected = self.device.clone().unwrap_or_else(|| "default input".into());
@@ -1060,13 +1141,12 @@ impl eframe::App for App {
                 if ui
                     .add_enabled(!busy, egui::Button::new(format!("{FOLDER_OPEN} Open audio…")))
                     .clicked()
-                    && let Some(file) = rfd::FileDialog::new()
-                        .add_filter("audio", &["mp3", "m4a", "mp4", "wav", "flac", "ogg"])
-                        .pick_file()
                 {
-                    self.source = Some(Source::File(file));
-                    self.transcript.clear();
-                    self.status.clear();
+                    if self.has_untranscribed_recording() {
+                        self.confirm_discard = Some(Discard::OpenFile);
+                    } else {
+                        self.open_audio_file();
+                    }
                 }
                 match (&self.source, self.recorder.as_ref()) {
                     (_, Some(recorder)) => {
@@ -1330,6 +1410,8 @@ impl eframe::App for App {
         });
 
         let mut show_vocabulary = self.show_vocabulary;
+        self.show_discard_dialog(ui.ctx());
+
         egui::Window::new("Vocabulary")
             .open(&mut show_vocabulary)
             .default_size([420.0, 320.0])
