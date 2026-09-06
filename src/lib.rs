@@ -31,8 +31,8 @@ pub const WHISPER_SAMPLE_RATE: usize = 16_000;
 pub enum Engine {
     /// ggml Whisper models (`ggml-*.bin`) via whisper.cpp.
     Whisper,
-    /// NVIDIA Parakeet (`*.gguf`) via transcribe.cpp.
-    Parakeet,
+    /// GGUF models (NVIDIA Parakeet, Qwen3-ASR) via transcribe.cpp.
+    TranscribeCpp,
 }
 
 impl Engine {
@@ -40,7 +40,7 @@ impl Engine {
     /// transcribe.cpp ones are `.gguf`.
     pub fn for_model(model: &Path) -> Engine {
         match model.extension().and_then(|e| e.to_str()) {
-            Some(ext) if ext.eq_ignore_ascii_case("gguf") => Engine::Parakeet,
+            Some(ext) if ext.eq_ignore_ascii_case("gguf") => Engine::TranscribeCpp,
             _ => Engine::Whisper,
         }
     }
@@ -373,7 +373,7 @@ where
     let progress = Arc::new(progress);
     let raw_segments = match Engine::for_model(&opts.model) {
         Engine::Whisper => run_whisper(&samples, opts, &progress)?,
-        Engine::Parakeet => run_parakeet(&samples, opts, &progress)?,
+        Engine::TranscribeCpp => run_transcribe_cpp(&samples, opts, &progress)?,
     };
 
     // First pass: count repeated name-like leading prefixes — the
@@ -530,23 +530,28 @@ where
     Ok(raw_segments)
 }
 
-/// Decode with transcribe.cpp (NVIDIA Parakeet). The model has no
-/// prompt, so vocabulary/context are ignored; it also has no notion of
-/// sentences, so its word timestamps are regrouped into segments at
-/// pauses and sentence ends. Audio is fed in chunks of a few minutes cut
-/// at silences (found with the VAD model), which bounds memory on long
-/// recordings and gives progress updates.
-fn run_parakeet<F>(samples: &[f32], opts: &Options, progress: &Arc<F>) -> Result<Vec<RawSegment>>
+/// Decode with transcribe.cpp. These models have no prompt, so
+/// vocabulary/context are ignored. Audio is cut at silences found by the
+/// VAD model, which bounds memory on long recordings and gives progress
+/// updates. Models with word alignment (Parakeet) get chunks of a few
+/// minutes and their word timestamps are regrouped into segments at
+/// pauses and sentence ends; models without any timestamps (Qwen3-ASR)
+/// decode each stretch of speech on its own, timed by the VAD boundaries.
+fn run_transcribe_cpp<F>(
+    samples: &[f32],
+    opts: &Options,
+    progress: &Arc<F>,
+) -> Result<Vec<RawSegment>>
 where
     F: Fn(Progress) + Send + Sync + 'static,
 {
     use transcribe_cpp::{Model, RunOptions, SessionOptions, TimestampKind};
 
     if opts.translate {
-        bail!("translation needs a Whisper model; Parakeet only transcribes");
+        bail!("translation needs a Whisper model; this one only transcribes");
     }
     if opts.beam_size.is_some_and(|n| n > 1) {
-        bail!("beam search is a Whisper option; Parakeet decodes greedily");
+        bail!("beam search is a Whisper option; this model decodes greedily");
     }
     static QUIET: std::sync::Once = std::sync::Once::new();
     QUIET.call_once(transcribe_cpp::disable_logging);
@@ -555,42 +560,52 @@ where
     let threads = thread_count(opts);
     let model = Model::load(&opts.model)
         .with_context(|| format!("failed to load model {}", opts.model.display()))?;
-    let mut session = model.session_with(&SessionOptions { n_threads: threads, ..SessionOptions::default() })?;
+    let word_timed = matches!(
+        model.capabilities().max_timestamp_kind,
+        TimestampKind::Word | TimestampKind::Token
+    );
+    let mut session =
+        model.session_with(&SessionOptions { n_threads: threads, ..SessionOptions::default() })?;
     let run = RunOptions {
-        timestamps: TimestampKind::Word,
+        timestamps: if word_timed { TimestampKind::Word } else { TimestampKind::None },
         language: (opts.language != "auto").then(|| opts.language.clone()),
         ..RunOptions::default()
     };
+    let to_ms = |sample: usize| (sample as i64) * 1000 / WHISPER_SAMPLE_RATE as i64;
+    let secs = |s: f32| (s * WHISPER_SAMPLE_RATE as f32) as usize;
 
-    let chunks = speech_chunks(samples, opts.vad_model.as_deref(), threads);
+    let spans = speech_spans(samples, opts.vad_model.as_deref(), threads);
+    let chunks = if word_timed {
+        merge_spans(&spans, secs(ALIGNED_CHUNK_SECS), usize::MAX)
+    } else {
+        merge_spans(&spans, secs(UTTERANCE_MAX_SECS), secs(UTTERANCE_GAP_SECS))
+    };
+
     let t1 = Instant::now();
-    // (start ms, end ms, word)
-    let mut words: Vec<(i64, i64, String)> = Vec::new();
+    // (start ms, end ms, text): words for aligned models, else one entry
+    // per decoded stretch of speech.
+    let mut pieces: Vec<(i64, i64, String)> = Vec::new();
     for &(start, end) in &chunks {
         progress(Progress::Transcribing {
             percent: (start * 100 / samples.len().max(1)) as i32,
         });
         let mut chunk = samples[start..end].to_vec();
-        let min_len = WHISPER_SAMPLE_RATE;
-        if chunk.len() < min_len {
-            chunk.resize(min_len, 0.0);
+        if chunk.len() < WHISPER_SAMPLE_RATE {
+            chunk.resize(WHISPER_SAMPLE_RATE, 0.0);
         }
         let result = session.run(&chunk, &run)?;
-        let offset_ms = (start as i64) * 1000 / WHISPER_SAMPLE_RATE as i64;
-        if result.words.is_empty() {
-            // No word alignment for this model build: keep the text as one
-            // block spanning the chunk.
+        let offset_ms = to_ms(start);
+        if !word_timed || result.words.is_empty() {
             let text = result.text.trim();
             if !text.is_empty() {
-                let end_ms = (end as i64) * 1000 / WHISPER_SAMPLE_RATE as i64;
-                words.push((offset_ms, end_ms, text.to_owned()));
+                pieces.push((offset_ms, to_ms(end), text.to_owned()));
             }
             continue;
         }
         for word in result.words {
             let text = word.text.trim();
             if !text.is_empty() {
-                words.push((word.t0_ms + offset_ms, word.t1_ms + offset_ms, text.to_owned()));
+                pieces.push((word.t0_ms + offset_ms, word.t1_ms + offset_ms, text.to_owned()));
             }
         }
     }
@@ -599,21 +614,31 @@ where
         took_secs: transcribe_secs,
         realtime_factor: audio_secs / transcribe_secs,
     });
-    Ok(group_words(&words))
+    if word_timed {
+        Ok(group_words(&pieces))
+    } else {
+        Ok(pieces.into_iter().map(|(s, e, text)| (s / 10, e / 10, text)).collect())
+    }
 }
 
-/// Longest stretch of audio handed to Parakeet in one call. Its encoder
-/// attends over the whole input, so memory grows quadratically with it.
-const PARAKEET_CHUNK_SECS: f32 = 240.0;
+/// Longest stretch handed to a word-aligned model (Parakeet) in one call.
+/// Its encoder attends over the whole input, so memory grows quadratically.
+const ALIGNED_CHUNK_SECS: f32 = 240.0;
 
-/// Split `samples` into chunks for Parakeet: speech spans found by the VAD
-/// model, padded a little and merged up to [`PARAKEET_CHUNK_SECS`], so cuts
-/// fall in silence. Without a VAD model (or if it finds nothing usable),
-/// fixed-length windows.
-fn speech_chunks(samples: &[f32], vad_model: Option<&Path>, threads: i32) -> Vec<(usize, usize)> {
-    let max_len = (PARAKEET_CHUNK_SECS * WHISPER_SAMPLE_RATE as f32) as usize;
+/// For models without timestamps, each decoded stretch becomes one
+/// transcript segment: stretches of speech separated by less than
+/// [`UTTERANCE_GAP_SECS`] of silence are joined, up to
+/// [`UTTERANCE_MAX_SECS`], so segments stay short enough for speaker
+/// labels and timestamps to be useful.
+const UTTERANCE_MAX_SECS: f32 = 20.0;
+const UTTERANCE_GAP_SECS: f32 = 0.6;
+
+/// Stretches of speech (sample ranges) found by the VAD model, padded a
+/// little so no word is clipped. Without a VAD model (or if it fails),
+/// the whole input as one span; [`merge_spans`] then cuts fixed windows.
+fn speech_spans(samples: &[f32], vad_model: Option<&Path>, threads: i32) -> Vec<(usize, usize)> {
     let pad = WHISPER_SAMPLE_RATE / 4;
-    let spans = vad_model
+    vad_model
         .and_then(|model| vad_speech_spans(model, samples, threads).ok())
         .map(|spans| {
             spans
@@ -621,12 +646,13 @@ fn speech_chunks(samples: &[f32], vad_model: Option<&Path>, threads: i32) -> Vec
                 .map(|(s, e)| (s.saturating_sub(pad), (e + pad).min(samples.len())))
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_else(|| vec![(0, samples.len())]);
-    merge_spans(&spans, max_len)
+        .unwrap_or_else(|| vec![(0, samples.len())])
 }
 
 /// Speech spans (sample indices) according to whisper.cpp's Silero VAD.
 fn vad_speech_spans(model: &Path, samples: &[f32], threads: i32) -> Result<Vec<(usize, usize)>> {
+    // whisper.cpp logs every VAD segment at info level; keep stderr clean.
+    whisper_rs::install_logging_hooks();
     let path = model.to_str().context("VAD model path is not valid UTF-8")?;
     let mut params = WhisperVadContextParams::default();
     params.set_n_threads(threads);
@@ -645,14 +671,19 @@ fn vad_speech_spans(model: &Path, samples: &[f32], threads: i32) -> Result<Vec<(
 
 /// Join consecutive spans into chunks no longer than `max_len` samples
 /// (a chunk covers everything from its first span's start to its last
-/// span's end, silence included). A single span longer than `max_len`
-/// is cut into equal pieces.
-fn merge_spans(spans: &[(usize, usize)], max_len: usize) -> Vec<(usize, usize)> {
+/// span's end, silence included), never joining across a gap wider than
+/// `max_gap`. A single span longer than `max_len` is cut into equal
+/// pieces.
+fn merge_spans(spans: &[(usize, usize)], max_len: usize, max_gap: usize) -> Vec<(usize, usize)> {
     let mut chunks: Vec<(usize, usize)> = Vec::new();
     let mut current: Option<(usize, usize)> = None;
     for &(start, end) in spans {
         current = match current {
-            Some((cs, _)) if end.saturating_sub(cs) <= max_len => Some((cs, end)),
+            Some((cs, ce))
+                if end.saturating_sub(cs) <= max_len && start.saturating_sub(ce) <= max_gap =>
+            {
+                Some((cs, end))
+            }
             Some(chunk) => {
                 chunks.push(chunk);
                 Some((start, end))
@@ -917,10 +948,19 @@ mod tests {
     #[test]
     fn merges_speech_spans_into_bounded_chunks() {
         // Three spans; the first two fit one chunk, the third starts a new one.
-        assert_eq!(merge_spans(&[(0, 40), (50, 90), (100, 150)], 100), vec![(0, 90), (100, 150)]);
+        let any_gap = usize::MAX;
+        assert_eq!(
+            merge_spans(&[(0, 40), (50, 90), (100, 150)], 100, any_gap),
+            vec![(0, 90), (100, 150)]
+        );
         // A single overlong span is cut into equal pieces.
-        assert_eq!(merge_spans(&[(0, 250)], 100), vec![(0, 84), (84, 168), (168, 250)]);
-        assert_eq!(merge_spans(&[], 100), Vec::<(usize, usize)>::new());
+        assert_eq!(merge_spans(&[(0, 250)], 100, any_gap), vec![(0, 84), (84, 168), (168, 250)]);
+        assert_eq!(merge_spans(&[], 100, any_gap), Vec::<(usize, usize)>::new());
+        // A gap wider than max_gap always starts a new chunk.
+        assert_eq!(
+            merge_spans(&[(0, 40), (45, 60), (80, 90)], 1000, 10),
+            vec![(0, 60), (80, 90)]
+        );
     }
 
     #[test]

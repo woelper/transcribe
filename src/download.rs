@@ -34,10 +34,11 @@ macro_rules! standard_model {
 /// are Whisper models run by whisper.cpp: large-v3-turbo is the best
 /// multilingual accuracy/speed tradeoff, distil-large-v3.5 is faster and
 /// slightly more accurate but English-only, and the small ones trade
-/// accuracy for speed and disk space. The `.gguf` entry is NVIDIA's
-/// Parakeet, run by transcribe.cpp: more accurate than any Whisper on
-/// English and an order of magnitude faster, but limited to 25 European
-/// languages and unable to take the vocabulary/context prompt.
+/// accuracy for speed and disk space. The `.gguf` entries run on
+/// transcribe.cpp and take no vocabulary/context prompt: NVIDIA's Parakeet
+/// is more accurate than any Whisper on English and an order of magnitude
+/// faster, for 25 European languages; Alibaba's Qwen3-ASR covers 52
+/// languages and is by far the most robust to background noise.
 pub const SPEECH_MODELS: &[SpeechModel] = &[
     standard_model!("tiny", "75 MB"),
     standard_model!("base", "142 MB"),
@@ -58,6 +59,19 @@ pub const SPEECH_MODELS: &[SpeechModel] = &[
         note: "25 European languages, fastest, ignores vocabulary/context",
         file: "parakeet-tdt-0.6b-v3-Q8_0.gguf",
         url: "https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf/resolve/main/parakeet-tdt-0.6b-v3-Q8_0.gguf",
+    },    SpeechModel {
+        name: "qwen3-asr-1.7b",
+        size: "2.1 GB",
+        note: "52 languages, best in noise, ignores vocabulary/context",
+        file: "Qwen3-ASR-1.7B-Q8_0.gguf",
+        url: "https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf/resolve/main/Qwen3-ASR-1.7B-Q8_0.gguf",
+    },
+    SpeechModel {
+        name: "qwen3-asr-0.6b",
+        size: "811 MB",
+        note: "52 languages, small, ignores vocabulary/context",
+        file: "Qwen3-ASR-0.6B-Q8_0.gguf",
+        url: "https://huggingface.co/handy-computer/Qwen3-ASR-0.6B-gguf/resolve/main/Qwen3-ASR-0.6B-Q8_0.gguf",
     },
 ];
 

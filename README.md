@@ -3,8 +3,8 @@
 ![Transcribe](assets/screenshot.png)
 
 Local, offline speech-to-text for meetings and recordings. Runs OpenAI's
-Whisper via [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and
-NVIDIA's Parakeet via [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp),
+Whisper via [whisper.cpp](https://github.com/ggerganov/whisper.cpp), and
+NVIDIA's Parakeet and Alibaba's Qwen3-ASR via [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp),
 Metal-accelerated, with speaker detection, voice enrollment (so speakers get
 real names), and local transcript summaries. Nothing leaves your machine.
 
@@ -23,8 +23,10 @@ app downloads the models it needs into `~/.transcribe/models` on first use.
   kind that takes the vocabulary and context notes. distil-large-v3.5 is
   faster and slightly more accurate but English-only. **parakeet-tdt-0.6b-v3**
   is more accurate than any Whisper on English and an order of magnitude
-  faster, at a third of the size, but covers 25 European languages only and
-  ignores the vocabulary/context prompt (see [Models](#models)).
+  faster, at a third of the size, but covers 25 European languages only.
+  **qwen3-asr-1.7b** covers 52 languages and is by far the most robust to
+  background noise. Neither takes the vocabulary/context prompt (see
+  [Models](#models)).
 - Silence and background noise are skipped with a voice-activity model
   (Silero, fetched on first use), so Whisper no longer invents sentences for
   the quiet parts of long recordings.
@@ -116,23 +118,30 @@ Setup, and record from that instead.
 | large-v3 | whisper.cpp | 99 | 2.9 GB | 7.4% | most accurate Whisper, slowest |
 | distil-large-v3.5 | whisper.cpp | English | 1.5 GB | ≈ large-v3 | ~5x faster than large-v3 |
 | parakeet-tdt-0.6b-v3 | transcribe.cpp | 25 European | 705 MB | 6.3% | ~20x faster than large-v3, no prompt, no translation |
+| qwen3-asr-1.7b | transcribe.cpp | 52 | 2.1 GB | ≈ large-v3, far better in noise | no prompt, no translation, segments timed by the VAD |
+| qwen3-asr-0.6b | transcribe.cpp | 52 | 811 MB | slightly worse | small; same limits as 1.7b |
 | tiny … medium | whisper.cpp | 99 | 75 MB – 1.5 GB | worse | quick drafts |
 
 \*Average word error rate on the Hugging Face Open ASR leaderboard; lower is
-better. Parakeet is also the most robust to background noise. Its 25
+better (Qwen3-ASR is not on it; on Whisper's own multilingual and
+noisy-speech benchmarks it beats large-v3 clearly). Parakeet's 25
 languages are Bulgarian, Croatian, Czech, Danish, Dutch, English, Estonian,
 Finnish, French, German, Greek, Hungarian, Italian, Latvian, Lithuanian,
 Maltese, Polish, Portuguese, Romanian, Russian, Slovak, Slovenian, Spanish,
 Swedish, and Ukrainian. Because it has no prompt, jargon-heavy meetings
 where the vocabulary list matters are better served by a Whisper model.
 Long recordings are fed to Parakeet in chunks of a few minutes cut at
-silences, so memory stays flat and progress is reported.
+silences, so memory stays flat and progress is reported. Qwen3-ASR produces
+no timestamps of its own, so each stretch of speech between silences (up to
+20 seconds) is decoded on its own and timed by the voice-activity model;
+timestamps and speaker labels work as usual, at that granularity.
 
 ## Building from source
 
 ```sh
 ./download-model.sh                # fetches ggml-large-v3-turbo (~1.6 GB) into models/
 ./download-model.sh parakeet       # optional: Parakeet-TDT-0.6B-v3 (~705 MB)
+./download-model.sh qwen3-asr      # optional: Qwen3-ASR-1.7B (~2.1 GB)
 ./download-diarization-models.sh   # optional: speaker-detection models (~35 MB)
 cargo build --release
 cargo run --release                # starts the app
@@ -161,7 +170,8 @@ The same engine is available as a CLI for scripting and batch work:
 ./target/release/transcribe -m models/parakeet-tdt-0.6b-v3-Q8_0.gguf talk.mp3   # Parakeet
 ```
 
-The engine follows the model file: `.bin` is Whisper, `.gguf` is Parakeet.
+The engine follows the model file: `.bin` is Whisper, `.gguf` is
+transcribe.cpp (Parakeet, Qwen3-ASR).
 
 | Flag | Effect |
 |---|---|
@@ -170,7 +180,7 @@ The engine follows the model file: `.bin` is Whisper, `.gguf` is Parakeet.
 | `-d` | detect speakers, prefix segments with `Speaker N:` |
 | `-l <lang>` | language code (default `auto`) |
 | `-b <n>` | beam search width (slower, slightly more accurate; default greedy) |
-| `-m <path>` | model path (default `models/ggml-large-v3-turbo.bin`); a `.gguf` selects Parakeet |
+| `-m <path>` | model path (default `models/ggml-large-v3-turbo.bin`); a `.gguf` selects transcribe.cpp |
 | `--no-vad` | decode silence too instead of skipping it with the Silero VAD model |
 | `-p <text>` | initial prompt — seed names/jargon or bias output style |
 | `--translate` | translate to English |
@@ -199,7 +209,8 @@ Voices can also be enrolled from the command line:
    decoding with temperature fallback, decoding only the speech stretches.
    Parakeet: transcribe.cpp via transcribe-cpp, fed chunks of up to four
    minutes cut at silences; its word timestamps are regrouped into segments
-   at pauses and sentence ends
+   at pauses and sentence ends. Qwen3-ASR: the same, but one decode per
+   stretch of speech, timed by the VAD boundaries
 6. With speaker detection: each segment is labeled with the speaker whose
    turns overlap it most
 
