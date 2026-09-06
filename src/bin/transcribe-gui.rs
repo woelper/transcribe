@@ -1258,31 +1258,6 @@ impl eframe::App for App {
                 {
                     self.show_rename = !self.show_rename;
                 }
-                let summary_model_missing =
-                    self.summary_model_path().is_none_or(|p| !p.exists());
-                let can_summarize = !self.transcript.trim().is_empty()
-                    && !busy
-                    && self.summary_job.is_none()
-                    && self.download.is_none()
-                    && self.models_dir.is_some();
-                let summarize_hover = if summary_model_missing {
-                    format!(
-                        "summarize the transcript with a local Llama model — \
-                         first use downloads it ({SUMMARY_MODEL_SIZE})"
-                    )
-                } else {
-                    "summarize the transcript with the local Llama model".into()
-                };
-                if ui
-                    .add_enabled(
-                        can_summarize,
-                        egui::Button::new(format!("{LIST_BULLETS} Summarize")),
-                    )
-                    .on_hover_text(summarize_hover)
-                    .clicked()
-                {
-                    self.start_summarization();
-                }
             });
             let context_hint = if prompt_supported {
                 "context for this recording — meeting name, speakers, topics, notes \
@@ -1348,6 +1323,34 @@ impl eframe::App for App {
                             Ok(()) => format!("saved to {}", path.display()),
                             Err(e) => format!("error: failed to save: {e}"),
                         };
+                    }
+                }
+                // Summarize sits left of Save, likewise only once there is a transcript.
+                if !self.transcript.is_empty() {
+                    let summary_model_missing =
+                        self.summary_model_path().is_none_or(|p| !p.exists());
+                    let can_summarize = !self.transcript.trim().is_empty()
+                        && !busy
+                        && self.summary_job.is_none()
+                        && self.download.is_none()
+                        && self.models_dir.is_some();
+                    let summarize_hover = if summary_model_missing {
+                        format!(
+                            "summarize the transcript with a local Llama model — \
+                             first use downloads it ({SUMMARY_MODEL_SIZE})"
+                        )
+                    } else {
+                        "summarize the transcript with the local Llama model".into()
+                    };
+                    if ui
+                        .add_enabled(
+                            can_summarize,
+                            egui::Button::new(format!("{LIST_BULLETS} Summarize")),
+                        )
+                        .on_hover_text(summarize_hover)
+                        .clicked()
+                    {
+                        self.start_summarization();
                     }
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
