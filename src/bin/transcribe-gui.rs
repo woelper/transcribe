@@ -59,6 +59,10 @@ const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(0xe9, 0xe6, 0xfb);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(0x2b, 0xd8, 0x8f);
 const RED: egui::Color32 = egui::Color32::from_rgb(0xef, 0x50, 0x6e);
 const TRACK_OFF: egui::Color32 = egui::Color32::from_rgb(0xd8, 0xdb, 0xe8);
+/// Faint outline for the model picker.
+const FRAME: egui::Color32 = egui::Color32::from_rgb(0xdd, 0xe0, 0xec);
+/// Memory bar in the model picker.
+const MEMORY: egui::Color32 = egui::Color32::from_rgb(0xf5, 0xa6, 0x23);
 const SHADOW: egui::Color32 = egui::Color32::from_rgba_premultiplied(5, 5, 8, 16);
 
 /// White rounded card with a soft drop shadow — the base surface every
@@ -78,6 +82,105 @@ const WIDGET_RADIUS: u8 = 12;
 /// a pill).
 fn progress_bar(fraction: f32) -> egui::ProgressBar {
     egui::ProgressBar::new(fraction).corner_radius(egui::CornerRadius::same(WIDGET_RADIUS))
+}
+
+/// Layout of the model picker's rows: name and size on the left, three
+/// rating bars on the right.
+const MODEL_ROW_WIDTH: f32 = 366.0;
+const MODEL_ROW_HEIGHT: f32 = 32.0;
+const MODEL_BARS_LEFT: f32 = 204.0;
+const MODEL_BAR_WIDTH: f32 = 42.0;
+const MODEL_BAR_GAP: f32 = 12.0;
+
+/// Column titles above the rating bars in the model picker.
+fn model_rows_header(ui: &mut egui::Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(MODEL_ROW_WIDTH, 16.0), egui::Sense::hover());
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    for (i, title) in ["accuracy", "speed", "memory"].into_iter().enumerate() {
+        let x = rect.left() + MODEL_BARS_LEFT + i as f32 * (MODEL_BAR_WIDTH + MODEL_BAR_GAP);
+        ui.painter().text(
+            egui::pos2(x + MODEL_BAR_WIDTH / 2.0, rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            title,
+            font.clone(),
+            ui.visuals().weak_text_color(),
+        );
+    }
+}
+
+/// One selectable row of the model picker: installed/download icon and
+/// name, size and caveat underneath, and bars for accuracy, speed, and
+/// memory (relative to the largest model) so the tradeoff is visible.
+fn model_row(
+    ui: &mut egui::Ui,
+    model: &transcribe::download::SpeechModel,
+    selected: bool,
+    installed: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(MODEL_ROW_WIDTH, MODEL_ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    let painter = ui.painter();
+    let radius = egui::CornerRadius::same(10);
+    if selected {
+        painter.rect_filled(rect, radius, ACCENT_SOFT);
+    } else if response.hovered() {
+        painter.rect_filled(rect, radius, BUTTON_HOVER);
+    }
+
+    let icon = if installed { CHECK } else { DOWNLOAD_SIMPLE };
+    let body = egui::TextStyle::Body.resolve(ui.style());
+    let small = egui::TextStyle::Small.resolve(ui.style());
+    let left = rect.left() + 10.0;
+    // Text stays in its column; a long caveat is cut rather than
+    // running into the bars.
+    let text_clip = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.left() + MODEL_BARS_LEFT - 8.0, rect.max.y),
+    );
+    let text_painter = painter.with_clip_rect(text_clip);
+    text_painter.text(
+        egui::pos2(left, rect.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        format!("{icon} {}", model.name),
+        body,
+        TEXT,
+    );
+    let detail = if model.note.is_empty() {
+        model.size_label()
+    } else {
+        format!("{} · {}", model.size_label(), model.note)
+    };
+    text_painter.text(
+        egui::pos2(left, rect.bottom() - 2.0),
+        egui::Align2::LEFT_BOTTOM,
+        detail,
+        small,
+        ui.visuals().weak_text_color(),
+    );
+
+    let largest = SPEECH_MODELS.iter().map(|m| m.mb).max().unwrap_or(1) as f32;
+    let bars = [
+        (model.accuracy, ACCENT),
+        (model.speed, GREEN),
+        (model.mb as f32 / largest, MEMORY),
+    ];
+    for (i, (fraction, color)) in bars.into_iter().enumerate() {
+        let x = rect.left() + MODEL_BARS_LEFT + i as f32 * (MODEL_BAR_WIDTH + MODEL_BAR_GAP);
+        let track = egui::Rect::from_min_size(
+            egui::pos2(x, rect.center().y - 3.0),
+            egui::vec2(MODEL_BAR_WIDTH, 6.0),
+        );
+        painter.rect_filled(track, 3.0, TRACK_OFF);
+        let fill = egui::Rect::from_min_size(
+            track.min,
+            egui::vec2(MODEL_BAR_WIDTH * fraction.clamp(0.05, 1.0), 6.0),
+        );
+        painter.rect_filled(fill, 3.0, color);
+    }
+    response
 }
 
 /// Solid filled button with white text, for accented actions.
@@ -983,40 +1086,36 @@ impl eframe::App for App {
                 };
             });
             ui.horizontal_wrapped(|ui| {
-                let labels: Vec<(String, String)> = SPEECH_MODELS
-                    .iter()
-                    .map(|m| {
-                        let installed = self
-                            .models_dir
-                            .as_ref()
-                            .is_some_and(|dir| dir.join(m.file).exists());
-                        let note = if m.note.is_empty() {
-                            String::new()
-                        } else {
-                            format!(", {}", m.note)
-                        };
-                        let label = if installed {
-                            format!("{CHECK} {}{note}", m.name)
-                        } else {
-                            format!("{DOWNLOAD_SIMPLE} {} ({}{note})", m.name, m.size)
-                        };
-                        (m.name.to_owned(), label)
-                    })
-                    .collect();
                 let model_enabled =
                     self.models_dir.is_some() && running.is_none() && self.download.is_none();
                 let mut picked = false;
-                ui.add_enabled_ui(model_enabled, |ui| {
-                    egui::ComboBox::from_id_salt("model")
-                        .selected_text(&self.model)
-                        .show_ui(ui, |ui| {
-                            for (name, label) in &labels {
-                                picked |= ui
-                                    .selectable_value(&mut self.model, name.clone(), label)
-                                    .clicked();
-                            }
+                // A faint frame sets the model picker apart from the plain buttons.
+                egui::Frame::new()
+                    .stroke(egui::Stroke::new(1.0, FRAME))
+                    .corner_radius(egui::CornerRadius::same(WIDGET_RADIUS))
+                    .show(ui, |ui| {
+                        ui.add_enabled_ui(model_enabled, |ui| {
+                            egui::ComboBox::from_id_salt("model")
+                                .selected_text(&self.model)
+                                .width(230.0)
+                                // Tall enough for every model without scrolling.
+                                .height(600.0)
+                                .show_ui(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    model_rows_header(ui);
+                                    for m in SPEECH_MODELS {
+                                        let installed = self
+                                            .models_dir
+                                            .as_ref()
+                                            .is_some_and(|dir| dir.join(m.file).exists());
+                                        if model_row(ui, m, self.model == m.name, installed).clicked() {
+                                            self.model = m.name.to_owned();
+                                            picked = true;
+                                        }
+                                    }
+                                });
                         });
-                });
+                    });
                 if picked {
                     self.start_download_if_missing();
                 }

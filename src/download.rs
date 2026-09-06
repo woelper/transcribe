@@ -6,7 +6,13 @@ use anyhow::{Context, Result, bail};
 
 pub struct SpeechModel {
     pub name: &'static str,
-    pub size: &'static str,
+    /// Download size in MB (also a fair proxy for RAM use).
+    pub mb: u32,
+    /// Relative accuracy and speed, 0..=1 across this list — for the
+    /// picker's bars, not a benchmark: ordered by Open ASR leaderboard
+    /// WER / RTFx where available, else by whisper.cpp's own size ladder.
+    pub accuracy: f32,
+    pub speed: f32,
     /// Caveat shown in the model picker, e.g. a language restriction.
     pub note: &'static str,
     /// Local filename under models/.
@@ -15,10 +21,12 @@ pub struct SpeechModel {
 }
 
 macro_rules! standard_model {
-    ($name:literal, $size:literal) => {
+    ($name:literal, $mb:literal, $accuracy:literal, $speed:literal) => {
         SpeechModel {
             name: $name,
-            size: $size,
+            mb: $mb,
+            accuracy: $accuracy,
+            speed: $speed,
             note: "",
             file: concat!("ggml-", $name, ".bin"),
             url: concat!(
@@ -40,40 +48,59 @@ macro_rules! standard_model {
 /// faster, for 25 European languages; Alibaba's Qwen3-ASR covers 52
 /// languages and is by far the most robust to background noise.
 pub const SPEECH_MODELS: &[SpeechModel] = &[
-    standard_model!("tiny", "75 MB"),
-    standard_model!("base", "142 MB"),
-    standard_model!("small", "466 MB"),
-    standard_model!("medium", "1.5 GB"),
-    standard_model!("large-v3-turbo", "1.6 GB"),
-    standard_model!("large-v3", "2.9 GB"),
+    standard_model!("tiny", 75, 0.2, 1.0),
+    standard_model!("base", 142, 0.3, 0.95),
+    standard_model!("small", 466, 0.45, 0.8),
+    standard_model!("medium", 1500, 0.6, 0.45),
+    standard_model!("large-v3-turbo", 1600, 0.75, 0.5),
+    standard_model!("large-v3", 2900, 0.8, 0.25),
     SpeechModel {
         name: "distil-large-v3.5",
-        size: "1.5 GB",
+        mb: 1500,
+        accuracy: 0.8,
+        speed: 0.65,
         note: "English only",
         file: "ggml-distil-large-v3.5.bin",
         url: "https://huggingface.co/distil-whisper/distil-large-v3.5-ggml/resolve/main/ggml-model.bin",
     },
     SpeechModel {
         name: "parakeet-tdt-0.6b-v3",
-        size: "705 MB",
-        note: "25 European languages, fastest, ignores vocabulary/context",
+        mb: 705,
+        accuracy: 0.9,
+        speed: 1.0,
+        note: "25 EU langs, no prompt",
         file: "parakeet-tdt-0.6b-v3-Q8_0.gguf",
         url: "https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf/resolve/main/parakeet-tdt-0.6b-v3-Q8_0.gguf",
     },    SpeechModel {
         name: "qwen3-asr-1.7b",
-        size: "2.1 GB",
-        note: "52 languages, best in noise, ignores vocabulary/context",
+        mb: 2084,
+        accuracy: 0.9,
+        speed: 0.55,
+        note: "52 languages, no prompt",
         file: "Qwen3-ASR-1.7B-Q8_0.gguf",
         url: "https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf/resolve/main/Qwen3-ASR-1.7B-Q8_0.gguf",
     },
     SpeechModel {
         name: "qwen3-asr-0.6b",
-        size: "811 MB",
-        note: "52 languages, small, ignores vocabulary/context",
+        mb: 811,
+        accuracy: 0.75,
+        speed: 0.85,
+        note: "52 languages, no prompt",
         file: "Qwen3-ASR-0.6B-Q8_0.gguf",
         url: "https://huggingface.co/handy-computer/Qwen3-ASR-0.6B-gguf/resolve/main/Qwen3-ASR-0.6B-Q8_0.gguf",
     },
 ];
+
+impl SpeechModel {
+    /// "705 MB" / "1.6 GB".
+    pub fn size_label(&self) -> String {
+        if self.mb >= 1000 {
+            format!("{:.1} GB", self.mb as f32 / 1000.0)
+        } else {
+            format!("{} MB", self.mb)
+        }
+    }
+}
 
 pub fn model_by_name(name: &str) -> Option<&'static SpeechModel> {
     SPEECH_MODELS.iter().find(|m| m.name == name)
