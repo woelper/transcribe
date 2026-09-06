@@ -2,6 +2,10 @@
 
 ![Transcribe](assets/screenshot.png)
 
+<p align="center">
+  <a href="https://github.com/woelper/transcribe/releases/latest"><img src="https://img.shields.io/badge/Download-macOS%20%7C%20Linux%20%7C%20Windows-6c5ce7?style=for-the-badge&logo=github&logoColor=white" alt="Download the latest release"></a>
+</p>
+
 Local, offline speech-to-text for meetings and recordings. Runs OpenAI's
 Whisper via [whisper.cpp](https://github.com/ggerganov/whisper.cpp), and
 NVIDIA's Parakeet and Alibaba's Qwen3-ASR via [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp),
