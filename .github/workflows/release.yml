@@ -54,8 +54,11 @@ jobs:
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
-          tar -czf transcribe-${{ matrix.target }}.tar.gz \
-            -C target/release transcribe transcribe-gui
+          mkdir -p dist/transcribe
+          cp target/release/transcribe target/release/transcribe-gui dist/transcribe/
+          cp assets/linux/transcribe.desktop install-linux.sh dist/transcribe/
+          cp assets/icon-256.png dist/transcribe/transcribe.png
+          tar -czf transcribe-${{ matrix.target }}.tar.gz -C dist transcribe
 
       - name: Package (Windows)
         if: runner.os == 'Windows'

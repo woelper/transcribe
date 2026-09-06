@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Transcribe
+Comment=Local, offline speech-to-text with speaker detection
+Exec=transcribe-gui
+Icon=transcribe
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=transcription;speech;whisper;meeting;
+StartupWMClass=transcribe

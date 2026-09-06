@@ -32,7 +32,11 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([860.0, 640.0])
-            .with_icon(icon),
+            .with_icon(icon)
+            // Wayland ignores with_icon: the dock/taskbar icon comes from
+            // the desktop entry whose name matches this app id (see
+            // install-linux.sh). On X11 it sets WM_CLASS for the same lookup.
+            .with_app_id("transcribe"),
         ..Default::default()
     };
     eframe::run_native(
