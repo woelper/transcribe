@@ -326,6 +326,13 @@ fn setup_theme(ctx: &egui::Context) {
     ctx.set_style_of(egui::Theme::Light, style);
 }
 
+/// Turning a stopped recording into 16 kHz samples, off the UI thread.
+struct Finishing {
+    fraction: f32,
+    secs: f64,
+    result: Option<anyhow::Result<Vec<f32>>>,
+}
+
 /// An action that would throw away the current, untranscribed recording.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Discard {
@@ -377,6 +384,8 @@ struct App {
     devices: Vec<String>,
     device: Option<String>, // None = system default input
     recorder: Option<Recorder>,
+    /// A stopped recording being resampled on a worker thread.
+    finishing: Option<Arc<Mutex<Finishing>>>,
     diarize: bool,
     timestamps: bool,
     transcript: String,
@@ -419,6 +428,9 @@ struct App {
     /// hasn't been would be lost by recording or opening something else,
     /// so those ask first.
     source_transcribed: bool,
+    /// Whether the transcript in the editor has been saved since it last
+    /// changed; recording or opening something else clears it.
+    transcript_saved: bool,
     /// Which action is waiting for the user to confirm discarding an
     /// untranscribed recording.
     confirm_discard: Option<Discard>,
@@ -461,6 +473,7 @@ impl App {
             devices: recorder::input_devices(),
             device: None,
             recorder: None,
+            finishing: None,
             diarize: false,
             timestamps: false,
             transcript: String::new(),
@@ -491,6 +504,7 @@ impl App {
             summary_job: None,
             summarize_pending: false,
             source_transcribed: false,
+            transcript_saved: true,
             confirm_discard: None,
         }
     }
@@ -878,6 +892,45 @@ impl App {
         });
     }
 
+    /// Collect the resampling worker's progress; returns the status to show
+    /// while it runs, and adopts the recording as the source when it's done.
+    fn poll_finishing(&mut self) -> Option<(String, f32)> {
+        let finishing = self.finishing.clone()?;
+        let mut finishing = finishing.lock().unwrap();
+        let secs = finishing.secs;
+        match finishing.result.take() {
+            // Whisper hallucinates phrases like "Thank you." on silence,
+            // so refuse to transcribe a recording with no signal in it.
+            Some(Ok(samples)) if is_silent(&samples) => {
+                self.finishing = None;
+                self.status = "error: the recording contains no audio signal — \
+                    check that the input device isn't muted and that this app has \
+                    microphone access (System Settings → Privacy & Security → Microphone)"
+                    .into();
+                None
+            }
+            Some(Ok(samples)) => {
+                self.finishing = None;
+                self.source = Some(Source::Recording {
+                    samples: Arc::new(samples),
+                    secs,
+                });
+                self.source_transcribed = false;
+                self.status = format!("recorded {}", format_mmss(secs));
+                None
+            }
+            Some(Err(e)) => {
+                self.finishing = None;
+                self.status = format!("error: {e:#}");
+                None
+            }
+            None => Some((
+                format!("finishing the {} recording ...", format_mmss(secs)),
+                finishing.fraction,
+            )),
+        }
+    }
+
     /// Collect worker updates; returns the current in-flight status, if any.
     fn poll_job(&mut self) -> Option<(String, Option<i32>, Option<String>)> {
         let job = self.job.clone()?;
@@ -885,6 +938,7 @@ impl App {
         match job.result.take() {
             Some(Ok(transcript)) => {
                 self.source_transcribed = true;
+                self.transcript_saved = false;
                 self.transcript = transcript.text;
                 self.speaker_voices = transcript.speaker_voices;
                 self.rename_inputs = vec![String::new(); self.speaker_voices.len()];
@@ -947,7 +1001,7 @@ impl App {
                 Err(e) => self.status = format!("error: {e:#}"),
             },
             Some(recorder) => {
-                let result = recorder.stop().and_then(|samples| {
+                let result = recorder.stop().into_16k(&mut |_| {}).and_then(|samples| {
                     let Some(dir) = &self.models_dir else {
                         anyhow::bail!("models/ directory not found");
                     };
@@ -979,10 +1033,24 @@ impl App {
         }
     }
 
-    /// A recording sits in memory and nothing has been transcribed from it
-    /// yet — recording or opening something else would lose it.
-    fn has_untranscribed_recording(&self) -> bool {
-        matches!(self.source, Some(Source::Recording { .. })) && !self.source_transcribed
+    /// What recording or opening something else would throw away: an
+    /// in-memory recording nothing has been transcribed from, an unsaved
+    /// transcript, or both. None when nothing would be lost.
+    fn discard_would_lose(&self) -> Option<String> {
+        let recording = match &self.source {
+            Some(Source::Recording { secs, .. }) if !self.source_transcribed => {
+                Some(format!("the {} recording, which hasn't been transcribed", format_mmss(*secs)))
+            }
+            _ => None,
+        };
+        let transcript = (!self.transcript.trim().is_empty() && !self.transcript_saved)
+            .then_some("the transcript, which hasn't been saved");
+        match (recording, transcript) {
+            (Some(r), Some(t)) => Some(format!("{r}, and {t}")),
+            (Some(r), None) => Some(r),
+            (None, Some(t)) => Some(t.to_owned()),
+            (None, None) => None,
+        }
     }
 
     /// Pick an audio file and make it the source.
@@ -998,12 +1066,13 @@ impl App {
         }
     }
 
-    /// Modal asking whether to throw away the untranscribed recording.
+    /// Modal asking whether to throw away the untranscribed recording
+    /// and/or the unsaved transcript.
     fn show_discard_dialog(&mut self, ctx: &egui::Context) {
         let Some(action) = self.confirm_discard else { return };
-        let secs = match &self.source {
-            Some(Source::Recording { secs, .. }) => *secs,
-            _ => 0.0,
+        let Some(at_risk) = self.discard_would_lose() else {
+            self.confirm_discard = None;
+            return;
         };
         let (verb, confirm) = match action {
             Discard::Record => ("Starting a new recording", format!("{RECORD} Record anyway")),
@@ -1013,12 +1082,9 @@ impl App {
             .frame(card().inner_margin(egui::Margin::same(20)))
             .show(ctx, |ui| {
                 ui.set_max_width(380.0);
-                ui.heading(format!("{WARNING} Discard the current recording?"));
+                ui.heading(format!("{WARNING} Discard the current work?"));
                 ui.add_space(6.0);
-                ui.label(format!(
-                    "The {} recording hasn't been transcribed yet. {verb} throws it away.",
-                    format_mmss(secs)
-                ));
+                ui.label(format!("{verb} throws away {at_risk}."));
                 ui.add_space(14.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add(filled_button(confirm, RED)).clicked() {
@@ -1053,26 +1119,22 @@ impl App {
                 Err(e) => self.status = format!("error: {e:#}"),
             },
             Some(recorder) => {
-                let secs = recorder.duration_secs();
-                match recorder.stop() {
-                    // Whisper hallucinates phrases like "Thank you." on silence,
-                    // so refuse to transcribe a recording with no signal in it.
-                    Ok(samples) if is_silent(&samples) => {
-                        self.status = "error: the recording contains no audio signal — \
-                            check that the input device isn't muted and that this app has \
-                            microphone access (System Settings → Privacy & Security → Microphone)"
-                            .into();
-                    }
-                    Ok(samples) => {
-                        self.source = Some(Source::Recording {
-                            samples: Arc::new(samples),
-                            secs,
-                        });
-                        self.source_transcribed = false;
-                        self.status = format!("recorded {}", format_mmss(secs));
-                    }
-                    Err(e) => self.status = format!("error: {e:#}"),
-                }
+                // Stopping is cheap; resampling a long recording is not, so
+                // that runs on a worker and the status bar shows its progress.
+                let recording = recorder.stop();
+                let finishing = Arc::new(Mutex::new(Finishing {
+                    fraction: 0.0,
+                    secs: recording.duration_secs(),
+                    result: None,
+                }));
+                self.finishing = Some(finishing.clone());
+                self.status.clear();
+                std::thread::spawn(move || {
+                    let result = recording.into_16k(&mut |fraction| {
+                        finishing.lock().unwrap().fraction = fraction;
+                    });
+                    finishing.lock().unwrap().result = Some(result);
+                });
             }
         }
     }
@@ -1089,6 +1151,7 @@ impl eframe::App for App {
         // such as the snapshot test show the ground instead of transparency.
         ui.painter().rect_filled(ui.ctx().content_rect(), 0.0, GROUND);
         let running = self.poll_job();
+        let finishing = self.poll_finishing();
         let downloading = self.poll_download();
         let enrolling = self.poll_enrollment();
         let summarizing = self.poll_summary();
@@ -1098,6 +1161,7 @@ impl eframe::App for App {
             self.status = format!("error: recording failed: {error}");
         }
         if running.is_some()
+            || finishing.is_some()
             || downloading.is_some()
             || enrolling
             || summarizing
@@ -1107,7 +1171,7 @@ impl eframe::App for App {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         let recording = self.recorder.is_some();
-        let busy = running.is_some() || recording;
+        let busy = running.is_some() || recording || finishing.is_some();
 
         // Each panel is a white card floating on the lavender ground.
         let top_frame =
@@ -1123,9 +1187,10 @@ impl eframe::App for App {
                 } else {
                     egui::Button::new(format!("{RECORD} Record"))
                 };
-                let can_record = running.is_none() && self.enroll_recorder.is_none();
+                let can_record =
+                    running.is_none() && finishing.is_none() && self.enroll_recorder.is_none();
                 if ui.add_enabled(can_record, record_button).clicked() {
-                    if self.has_untranscribed_recording() {
+                    if self.discard_would_lose().is_some() {
                         self.confirm_discard = Some(Discard::Record);
                     } else {
                         self.toggle_recording();
@@ -1149,7 +1214,7 @@ impl eframe::App for App {
                     .add_enabled(!busy, egui::Button::new(format!("{FOLDER_OPEN} Open audio…")))
                     .clicked()
                 {
-                    if self.has_untranscribed_recording() {
+                    if self.discard_would_lose().is_some() {
                         self.confirm_discard = Some(Discard::OpenFile);
                     } else {
                         self.open_audio_file();
@@ -1177,6 +1242,9 @@ impl eframe::App for App {
                         if level == 0.0 && recorder.duration_secs() > 2.0 {
                             ui.colored_label(ui.visuals().warn_fg_color, format!("{WARNING} no signal!"));
                         }
+                    }
+                    _ if finishing.is_some() => {
+                        ui.weak("finishing the recording ...");
                     }
                     (Some(source), _) => {
                         ui.monospace(source.label());
@@ -1327,7 +1395,10 @@ impl eframe::App for App {
                         .save_file()
                     {
                         self.status = match std::fs::write(&path, &self.transcript) {
-                            Ok(()) => format!("saved to {}", path.display()),
+                            Ok(()) => {
+                                self.transcript_saved = true;
+                                format!("saved to {}", path.display())
+                            }
                             Err(e) => format!("error: failed to save: {e}"),
                         };
                     }
@@ -1361,6 +1432,12 @@ impl eframe::App for App {
                     }
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if let Some((status, fraction)) = &finishing {
+                        ui.add(egui::Spinner::new().color(ACCENT));
+                        ui.label(status);
+                        ui.add(progress_bar(*fraction).fill(ACCENT).show_percentage());
+                        return;
+                    }
                     match (&running, &downloading) {
                         (Some((status, percent, remaining)), _) => {
                             ui.add(egui::Spinner::new().color(ACCENT));
@@ -1409,13 +1486,18 @@ impl eframe::App for App {
                 .stick_to_bottom(running.is_some())
                 .show(ui, |ui| {
                     // Frameless, so the transcript sits directly on the card.
-                    ui.add_sized(
-                        ui.available_size(),
-                        egui::TextEdit::multiline(&mut self.transcript)
-                            .font(egui::TextStyle::Monospace)
-                            .frame(egui::Frame::NONE)
-                            .hint_text("transcript appears here"),
-                    );
+                    let edited = ui
+                        .add_sized(
+                            ui.available_size(),
+                            egui::TextEdit::multiline(&mut self.transcript)
+                                .font(egui::TextStyle::Monospace)
+                                .frame(egui::Frame::NONE)
+                                .hint_text("transcript appears here"),
+                        )
+                        .changed();
+                    if edited {
+                        self.transcript_saved = false;
+                    }
                 });
         });
 

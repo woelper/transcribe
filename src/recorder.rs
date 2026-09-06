@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SizedSample};
 
-use crate::{WHISPER_SAMPLE_RATE, resample_to_16k};
+use crate::{WHISPER_SAMPLE_RATE, resample_to_16k_with_progress};
 
 /// Names of all audio input devices. System audio (a YouTube video, a Zoom
 /// call) appears here once a loopback driver like BlackHole is installed.
@@ -87,15 +87,35 @@ impl Recorder {
         self.error.lock().unwrap().clone()
     }
 
-    /// Stop and return the recording as 16 kHz mono (whisper's input format).
-    pub fn stop(self) -> Result<Vec<f32>> {
+    /// Stop the stream and hand back the raw capture. Cheap; the costly
+    /// resampling happens in [`Recording::into_16k`], which the caller can
+    /// run on another thread (the audio stream itself can't leave this one).
+    pub fn stop(self) -> Recording {
         drop(self._stream);
         let mono = std::mem::take(&mut *self.samples.lock().unwrap());
-        if mono.is_empty() || self.rate as usize == WHISPER_SAMPLE_RATE {
-            Ok(mono)
-        } else {
-            resample_to_16k(&mono, self.rate as usize)
+        Recording { mono, rate: self.rate }
+    }
+}
+
+/// A finished capture at the device's sample rate.
+pub struct Recording {
+    mono: Vec<f32>,
+    rate: u32,
+}
+
+impl Recording {
+    pub fn duration_secs(&self) -> f64 {
+        self.mono.len() as f64 / self.rate as f64
+    }
+
+    /// Convert to 16 kHz mono (whisper's input format), reporting progress
+    /// 0..=1 — a long recording takes seconds to resample.
+    pub fn into_16k(self, progress: &mut dyn FnMut(f32)) -> Result<Vec<f32>> {
+        if self.mono.is_empty() || self.rate as usize == WHISPER_SAMPLE_RATE {
+            progress(1.0);
+            return Ok(self.mono);
         }
+        resample_to_16k_with_progress(&self.mono, self.rate as usize, progress)
     }
 }
 

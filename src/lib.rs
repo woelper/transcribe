@@ -6,7 +6,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
-use rubato::{Fft, FixedSync, Resampler};
+use rubato::audioadapter::AdapterMut;
+use rubato::audioadapter_buffers::owned::InterleavedOwned;
+use rubato::{Fft, FixedSync, Indexing, Resampler};
 use symphonia::core::codecs::CodecParameters;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
@@ -928,12 +930,72 @@ pub fn decode_to_mono_16k(path: &Path) -> Result<Vec<f32>> {
 
 /// Resample mono PCM from the given rate to 16 kHz.
 pub fn resample_to_16k(mono: &[f32], rate: usize) -> Result<Vec<f32>> {
+    resample_to_16k_with_progress(mono, rate, &mut |_| {})
+}
+
+/// [`resample_to_16k`] reporting its progress (0..=1) as it goes — a long
+/// recording takes seconds to resample, so callers can show a bar. Runs
+/// rubato's whole-clip algorithm chunk by chunk: trims the resampler's
+/// startup delay, then pumps zeros at the end until the output has the
+/// expected length.
+pub fn resample_to_16k_with_progress(
+    mono: &[f32],
+    rate: usize,
+    progress: &mut dyn FnMut(f32),
+) -> Result<Vec<f32>> {
     let frames = mono.len();
     let mut resampler = Fft::<f32>::new(rate, WHISPER_SAMPLE_RATE, 4096, 1, FixedSync::Input)?;
     let input = InterleavedSlice::new(mono, 1, frames)
         .map_err(|e| anyhow::anyhow!("resampler input: {e}"))?;
-    let output = resampler.process_all(&input, frames, None)?;
-    Ok(output.take_data())
+    let needed = resampler.process_all_needed_output_len(frames);
+    let mut output = InterleavedOwned::<f32>::new(0.0, 1, needed);
+    let expected = (resampler.resample_ratio() * frames as f64).ceil() as usize;
+
+    let mut indexing = Indexing {
+        input_offset: 0,
+        output_offset: 0,
+        active_channels_mask: None,
+        partial_len: None,
+    };
+    let mut frames_left = frames;
+    let mut output_len = 0;
+    let mut frames_to_trim = resampler.output_delay();
+    let chunk = resampler.input_frames_next();
+    let mut since_report = 0usize;
+    while frames_left > chunk {
+        let (n_in, n_out) = resampler.process_into_buffer(&input, &mut output, Some(&indexing))?;
+        frames_left -= n_in;
+        output_len += n_out;
+        indexing.input_offset += n_in;
+        indexing.output_offset += n_out;
+        if frames_to_trim > 0 && output_len > frames_to_trim {
+            output.copy_frames_within(frames_to_trim, 0, frames_to_trim);
+            output_len -= frames_to_trim;
+            indexing.output_offset -= frames_to_trim;
+            frames_to_trim = 0;
+        }
+        since_report += n_in;
+        if since_report >= rate {
+            since_report = 0;
+            progress((frames - frames_left) as f32 / frames.max(1) as f32);
+        }
+    }
+    if frames_left > 0 {
+        indexing.partial_len = Some(frames_left);
+        let (_, n_out) = resampler.process_into_buffer(&input, &mut output, Some(&indexing))?;
+        output_len += n_out;
+        indexing.output_offset += n_out;
+    }
+    indexing.partial_len = Some(0);
+    while output_len < expected {
+        let (_, n_out) = resampler.process_into_buffer(&input, &mut output, Some(&indexing))?;
+        output_len += n_out;
+        indexing.output_offset += n_out;
+    }
+    progress(1.0);
+    let mut data = output.take_data();
+    data.truncate(expected);
+    Ok(data)
 }
 
 /// Format a whisper timestamp (centiseconds) as HH:MM:SS.mmm.
@@ -951,6 +1013,25 @@ pub fn format_timestamp(centiseconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_resampler_matches_whole_clip_resampler() {
+        // 2.3 s of a 440 Hz tone at 48 kHz, not a multiple of the chunk size.
+        let rate = 48_000;
+        let mono: Vec<f32> = (0..(rate as f32 * 2.3) as usize)
+            .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin())
+            .collect();
+        let mut resampler =
+            Fft::<f32>::new(rate, WHISPER_SAMPLE_RATE, 4096, 1, FixedSync::Input).unwrap();
+        let input = InterleavedSlice::new(&mono, 1, mono.len()).unwrap();
+        let reference = resampler.process_all(&input, mono.len(), None).unwrap().take_data();
+
+        let mut reports = Vec::new();
+        let ours = resample_to_16k_with_progress(&mono, rate, &mut |f| reports.push(f)).unwrap();
+        assert_eq!(ours, reference);
+        assert_eq!(reports.last().copied(), Some(1.0));
+        assert!(reports.windows(2).all(|w| w[0] <= w[1]), "progress must not go backwards");
+    }
 
     #[test]
     fn merges_speech_spans_into_bounded_chunks() {
