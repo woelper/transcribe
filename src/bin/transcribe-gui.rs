@@ -1847,6 +1847,24 @@ mod tests {
 
     use super::parse_time;
 
+    /// A models directory with a fixed set of (empty) model files, so the
+    /// installed/download icons in snapshots don't depend on what happens
+    /// to be downloaded on the machine running the tests.
+    fn fixture_models_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("transcribe-snapshot-models");
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in [
+            "ggml-large-v3-turbo.bin",
+            "parakeet-tdt-0.6b-v3-Q8_0.gguf",
+            "Qwen3-ASR-0.6B-Q8_0.gguf",
+            "segmentation-3.0.onnx",
+            "wespeaker_en_voxceleb_CAM++.onnx",
+        ] {
+            std::fs::write(dir.join(file), b"").unwrap();
+        }
+        dir
+    }
+
     /// Renders the main view off-screen and stores it under
     /// tests/snapshots/ as a regression check, then dresses the same render
     /// up with window chrome and a drop shadow as assets/screenshot.png for
@@ -1864,6 +1882,7 @@ mod tests {
             .build_eframe(|cc| {
                 super::setup_theme(&cc.egui_ctx);
                 let mut app = super::App::new();
+                app.models_dir = Some(fixture_models_dir());
                 app.source = Some(super::Source::File("standup-2026-09-05.m4a".into()));
                 app.diarize = true;
                 app.context = "Weekly standup — Anna, Ben, Chris. Topics: \
@@ -1973,6 +1992,7 @@ mod tests {
             .build_eframe(|cc| {
                 super::setup_theme(&cc.egui_ctx);
                 let mut app = super::App::new();
+                app.models_dir = Some(fixture_models_dir());
                 app.source = Some(super::Source::File("standup-2026-09-05.m4a".into()));
                 app
             });
