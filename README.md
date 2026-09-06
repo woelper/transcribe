@@ -45,7 +45,8 @@ app downloads the models it needs into `~/.transcribe/models` on first use.
 - **Speakers…** enrolls voices so future transcripts label them by name;
   **Rename…** relabels `Speaker 1` in a finished transcript and enrolls that
   voice in one step (see below).
-- **Summarize** condenses the transcript with a local Llama model (downloaded
+- **Summarize** condenses the transcript with a local language model,
+  Qwen3.5 4B, using the context notes and vocabulary too (downloaded
   on first use).
 - The transcript is editable in place; **Save transcript…** writes it via a
   file dialog.

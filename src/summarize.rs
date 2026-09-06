@@ -1,4 +1,5 @@
-//! Local transcript summarization with a small llama.cpp chat model.
+//! Local transcript summarization with a small llama.cpp chat model
+//! (Qwen3.5 4B, see [`crate::download::SUMMARY_MODEL_FILE`]).
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -13,10 +14,11 @@ use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 
-/// Model context window. Bounds memory (the KV cache is on the order of
-/// 1 GB at this size for a 3B model); transcripts that tokenize past it
-/// are trimmed in the middle, keeping the start and the end.
-const N_CTX: u32 = 8192;
+/// Model context window: room for roughly two hours of meeting transcript
+/// (an hour is 10–15k tokens). Qwen3.5's hybrid attention keeps the KV
+/// cache small at this size. Transcripts that tokenize past it are trimmed
+/// in the middle, keeping the start and the end.
+const N_CTX: u32 = 32768;
 /// Tokens reserved for the generated summary.
 const MAX_OUTPUT_TOKENS: usize = 1024;
 /// Prompt tokens are fed to the model in chunks of this size.
@@ -80,11 +82,14 @@ fn trimmed(transcript: &str, keep: usize) -> String {
 
 /// Summarize `transcript` with the GGUF chat model at `model_path`,
 /// streaming the partial summary to `on_progress` as it generates.
-/// `context` is the user's free-form notes about the recording.
+/// `context` is the user's free-form notes about the recording;
+/// `vocabulary` the names and terms from vocabulary.md, so the summary
+/// spells them the way the user does.
 pub fn summarize(
     model_path: &Path,
     transcript: &str,
     context: &str,
+    vocabulary: &str,
     on_progress: &dyn Fn(&str),
 ) -> Result<String> {
     anyhow::ensure!(!transcript.trim().is_empty(), "nothing to summarize");
@@ -109,6 +114,13 @@ pub fn summarize(
         let mut user = String::new();
         if !context.trim().is_empty() {
             user.push_str(&format!("Notes about the recording:\n{context}\n\n"));
+        }
+        let terms = crate::vocabulary_terms(vocabulary);
+        if !terms.is_empty() {
+            user.push_str(&format!(
+                "Names and terms, spelled as they should appear: {}\n\n",
+                terms.join(", ")
+            ));
         }
         user.push_str(&format!(
             "Summarize this transcript:\n\n{}",
@@ -174,5 +186,33 @@ pub fn summarize(
         ctx.decode(&mut batch).context("generation failed")?;
     }
 
-    Ok(String::from_utf8_lossy(&out).trim().to_owned())
+    Ok(without_thinking(&String::from_utf8_lossy(&out)).trim().to_owned())
+}
+
+/// Drop a leading `<think>…</think>` block (Qwen's reasoning mode, off by
+/// default but not to be trusted to stay off), or everything up to a stray
+/// `</think>` if the opening tag was swallowed by the template.
+fn without_thinking(text: &str) -> &str {
+    let text = text.trim_start();
+    match (text.starts_with("<think>"), text.find("</think>")) {
+        (true, Some(end)) => &text[end + "</think>".len()..],
+        (true, None) => "",
+        (false, Some(end)) if !text[..end].contains('\n') || text.starts_with('\n') => {
+            &text[end + "</think>".len()..]
+        }
+        _ => text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_thinking;
+
+    #[test]
+    fn strips_reasoning_blocks() {
+        assert_eq!(without_thinking("<think>\nhmm\n</think>\n\nSummary."), "\n\nSummary.");
+        assert_eq!(without_thinking("Summary only."), "Summary only.");
+        assert_eq!(without_thinking("<think>unterminated"), "");
+        assert_eq!(without_thinking("\nhmm</think>Summary."), "Summary.");
+    }
 }

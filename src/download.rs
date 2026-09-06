@@ -112,12 +112,15 @@ pub struct DiarizationModel {
     pub url: &'static str,
 }
 
-/// Chat model used by the Summarize button: Llama 3.2 3B Instruct,
-/// Q4_K_M-quantized. Small enough to run on CPU at usable speed while
-/// still producing solid meeting summaries.
-pub const SUMMARY_MODEL_FILE: &str = "Llama-3.2-3B-Instruct-Q4_K_M.gguf";
-pub const SUMMARY_MODEL_URL: &str = "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf";
-pub const SUMMARY_MODEL_SIZE: &str = "2.0 GB";
+/// Chat model used by the Summarize button: Qwen3.5 4B Instruct (March
+/// 2026, Apache 2.0), Q4_K_M-quantized. Small enough to run on CPU at
+/// usable speed, strongly multilingual, and with a context window large
+/// enough to take a whole meeting transcript. Its optional thinking mode
+/// is off by default for this size; any `<think>` block is stripped anyway.
+pub const SUMMARY_MODEL_FILE: &str = "Qwen3.5-4B-Q4_K_M.gguf";
+pub const SUMMARY_MODEL_URL: &str =
+    "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf";
+pub const SUMMARY_MODEL_SIZE: &str = "2.6 GB";
 
 /// whisper.cpp's built-in voice activity detection model (Silero v5.1.2,
 /// under 1 MB). With it, whisper only decodes stretches that contain

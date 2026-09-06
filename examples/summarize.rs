@@ -17,7 +17,8 @@ fn main() -> anyhow::Result<()> {
     };
 
     let transcript = std::fs::read_to_string(&text)?;
-    let summary = transcribe::summarize::summarize(&model, &transcript, "", &|partial| {
+    let vocabulary = std::fs::read_to_string(transcribe::vocabulary_path()).unwrap_or_default();
+    let summary = transcribe::summarize::summarize(&model, &transcript, "", &vocabulary, &|partial| {
         eprint!("\r{} chars ...", partial.len());
         let _ = std::io::stderr().flush();
     })?;

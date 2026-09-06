@@ -117,12 +117,9 @@ pub fn prompt_with_vocabulary(vocabulary_md: &str) -> String {
     build_prompt(vocabulary_md, "")
 }
 
-/// Build a whisper initial prompt from the vocabulary glossary plus
-/// free-form context about the recording (meeting name, speakers, topics).
-/// Ends with [`DEFAULT_PROMPT`] — whisper keeps the tail of an over-long
-/// prompt, so the punctuation nudge survives even when a huge glossary
-/// gets truncated.
-pub fn build_prompt(vocabulary_md: &str, context: &str) -> String {
+/// The terms in a markdown vocabulary: every line that isn't a heading or
+/// comment, with list markers and backticks stripped.
+pub fn vocabulary_terms(vocabulary_md: &str) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     for line in vocabulary_md.lines() {
         let line = line.trim();
@@ -139,6 +136,16 @@ pub fn build_prompt(vocabulary_md: &str, context: &str) -> String {
             terms.push(line);
         }
     }
+    terms
+}
+
+/// Build a whisper initial prompt from the vocabulary glossary plus
+/// free-form context about the recording (meeting name, speakers, topics).
+/// Ends with [`DEFAULT_PROMPT`] — whisper keeps the tail of an over-long
+/// prompt, so the punctuation nudge survives even when a huge glossary
+/// gets truncated.
+pub fn build_prompt(vocabulary_md: &str, context: &str) -> String {
+    let terms = vocabulary_terms(vocabulary_md);
 
     let mut parts: Vec<String> = Vec::new();
     if !terms.is_empty() {

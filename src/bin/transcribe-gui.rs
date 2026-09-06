@@ -700,12 +700,19 @@ impl App {
         self.show_summary = true;
         let transcript = self.transcript.clone();
         let context = self.context.clone();
+        let vocabulary = self.vocabulary.clone();
         std::thread::spawn(move || {
             let progress = {
                 let job = job.clone();
                 move |text: &str| job.lock().unwrap().live = text.to_owned()
             };
-            let result = transcribe::summarize::summarize(&path, &transcript, &context, &progress);
+            let result = transcribe::summarize::summarize(
+                &path,
+                &transcript,
+                &context,
+                &vocabulary,
+                &progress,
+            );
             job.lock().unwrap().result = Some(result);
         });
     }
@@ -1336,11 +1343,11 @@ impl eframe::App for App {
                         && self.models_dir.is_some();
                     let summarize_hover = if summary_model_missing {
                         format!(
-                            "summarize the transcript with a local Llama model — \
+                            "summarize the transcript with a local language model — \
                              first use downloads it ({SUMMARY_MODEL_SIZE})"
                         )
                     } else {
-                        "summarize the transcript with the local Llama model".into()
+                        "summarize the transcript with the local language model".into()
                     };
                     if ui
                         .add_enabled(
