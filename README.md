@@ -2,10 +2,11 @@
 
 ![Transcribe](assets/screenshot.png)
 
-Local, offline speech-to-text for meetings and recordings. Built on
-[whisper.cpp](https://github.com/ggerganov/whisper.cpp) with Metal GPU
-acceleration, with speaker detection, voice enrollment (so speakers get real
-names), and local transcript summaries. Nothing leaves your machine.
+Local, offline speech-to-text for meetings and recordings. Runs OpenAI's
+Whisper via [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and
+NVIDIA's Parakeet via [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp),
+Metal-accelerated, with speaker detection, voice enrollment (so speakers get
+real names), and local transcript summaries. Nothing leaves your machine.
 
 Prebuilt apps for macOS, Linux, and Windows are on the
 [releases page](https://github.com/woelper/transcribe/releases). A released
@@ -16,11 +17,17 @@ app downloads the models it needs into `~/.transcribe/models` on first use.
 - **Open audio…** loads an mp3, mp4/m4a, wav, flac, or ogg file (decoded in
   Rust via symphonia, no ffmpeg needed), or hit **Record** to capture from
   any audio input device.
-- **Model dropdown** switches between whisper models (tiny … large-v3, plus
-  distil-large-v3.5 — faster and slightly more accurate than turbo, but
-  English-only) and downloads missing ones automatically. large-v3-turbo is
-  the default and the best accuracy/speed tradeoff (~19x realtime on an M2
-  Pro).
+- **Model dropdown** switches between models and downloads missing ones
+  automatically. Whisper large-v3-turbo is the default: 99 languages, the
+  best accuracy/speed tradeoff (~19x realtime on an M2 Pro), and the only
+  kind that takes the vocabulary and context notes. distil-large-v3.5 is
+  faster and slightly more accurate but English-only. **parakeet-tdt-0.6b-v3**
+  is more accurate than any Whisper on English and an order of magnitude
+  faster, at a third of the size, but covers 25 European languages only and
+  ignores the vocabulary/context prompt (see [Models](#models)).
+- Silence and background noise are skipped with a voice-activity model
+  (Silero, fetched on first use), so Whisper no longer invents sentences for
+  the quiet parts of long recordings.
 - **timestamps** / **speakers** toggles add `[HH:MM:SS.mmm --> HH:MM:SS.mmm]` prefixes and
   `Speaker N:` labels; the **count:** dropdown pins the number of people in
   the recording, which avoids phantom extra speakers.
@@ -101,18 +108,41 @@ To capture both sides of a call (their audio *and* your voice), create an
 *Aggregate Device* combining BlackHole and your microphone in Audio MIDI
 Setup, and record from that instead.
 
+## Models
+
+| Model | Engine | Languages | Size | English WER* | Notes |
+|---|---|---|---|---|---|
+| large-v3-turbo (default) | whisper.cpp | 99 | 1.6 GB | 7.8% | vocabulary/context prompt, translation |
+| large-v3 | whisper.cpp | 99 | 2.9 GB | 7.4% | most accurate Whisper, slowest |
+| distil-large-v3.5 | whisper.cpp | English | 1.5 GB | ≈ large-v3 | ~5x faster than large-v3 |
+| parakeet-tdt-0.6b-v3 | transcribe.cpp | 25 European | 705 MB | 6.3% | ~20x faster than large-v3, no prompt, no translation |
+| tiny … medium | whisper.cpp | 99 | 75 MB – 1.5 GB | worse | quick drafts |
+
+\*Average word error rate on the Hugging Face Open ASR leaderboard; lower is
+better. Parakeet is also the most robust to background noise. Its 25
+languages are Bulgarian, Croatian, Czech, Danish, Dutch, English, Estonian,
+Finnish, French, German, Greek, Hungarian, Italian, Latvian, Lithuanian,
+Maltese, Polish, Portuguese, Romanian, Russian, Slovak, Slovenian, Spanish,
+Swedish, and Ukrainian. Because it has no prompt, jargon-heavy meetings
+where the vocabulary list matters are better served by a Whisper model.
+Long recordings are fed to Parakeet in chunks of a few minutes cut at
+silences, so memory stays flat and progress is reported.
+
 ## Building from source
 
 ```sh
 ./download-model.sh                # fetches ggml-large-v3-turbo (~1.6 GB) into models/
+./download-model.sh parakeet       # optional: Parakeet-TDT-0.6B-v3 (~705 MB)
 ./download-diarization-models.sh   # optional: speaker-detection models (~35 MB)
 cargo build --release
 cargo run --release                # starts the app
 ```
 
-Other models: `./download-model.sh small` (`tiny`, `base`, `small`, `medium`,
-`large-v3`, and `.en` variants). Launch from the repo root so the app finds
-`models/`, `vocabulary.md`, and `speakers.json`.
+Other Whisper models: `./download-model.sh small` (`tiny`, `base`, `small`,
+`medium`, `large-v3`, and `.en` variants). Launch from the repo root so the
+app finds `models/`, `vocabulary.md`, and `speakers.json`. A first build
+needs CMake (whisper.cpp, llama.cpp, and transcribe.cpp are compiled from
+source).
 
 To get a double-clickable **Transcribe.app**, install [cargo-bundle](https://github.com/burtonageo/cargo-bundle)
 and run `./bundle.sh` (not `cargo bundle` directly — the script picks the GUI
@@ -128,7 +158,10 @@ The same engine is available as a CLI for scripting and batch work:
 ./target/release/transcribe recording.mp3                 # transcript to stdout
 ./target/release/transcribe -o out.txt -t recording.m4a   # to file, with timestamps
 ./target/release/transcribe -d -t meeting.m4a             # with speaker labels
+./target/release/transcribe -m models/parakeet-tdt-0.6b-v3-Q8_0.gguf talk.mp3   # Parakeet
 ```
+
+The engine follows the model file: `.bin` is Whisper, `.gguf` is Parakeet.
 
 | Flag | Effect |
 |---|---|
@@ -137,7 +170,8 @@ The same engine is available as a CLI for scripting and batch work:
 | `-d` | detect speakers, prefix segments with `Speaker N:` |
 | `-l <lang>` | language code (default `auto`) |
 | `-b <n>` | beam search width (slower, slightly more accurate; default greedy) |
-| `-m <path>` | model path (default `models/ggml-large-v3-turbo.bin`) |
+| `-m <path>` | model path (default `models/ggml-large-v3-turbo.bin`); a `.gguf` selects Parakeet |
+| `--no-vad` | decode silence too instead of skipping it with the Silero VAD model |
 | `-p <text>` | initial prompt — seed names/jargon or bias output style |
 | `--translate` | translate to English |
 | `--max-speakers <n>` | cap on distinct speakers for `-d` (default 8) |
@@ -159,10 +193,15 @@ Voices can also be enrolled from the command line:
    handoffs, via the model's per-frame speaker classes), wespeaker CAM++
    embeds each turn as a voice fingerprint, and average-linkage agglomerative
    clustering groups turns into speakers
-4. Run whisper.cpp via whisper-rs, Metal-accelerated, greedy decoding with
-   temperature fallback
-5. With speaker detection: each whisper segment is labeled with the speaker
-   whose turns overlap it most
+4. Voice activity detection (Silero, via whisper.cpp) marks the stretches
+   that contain speech
+5. Whisper models: whisper.cpp via whisper-rs, Metal-accelerated, greedy
+   decoding with temperature fallback, decoding only the speech stretches.
+   Parakeet: transcribe.cpp via transcribe-cpp, fed chunks of up to four
+   minutes cut at silences; its word timestamps are regrouped into segments
+   at pauses and sentence ends
+6. With speaker detection: each segment is labeled with the speaker whose
+   turns overlap it most
 
 If two speakers get merged, raise `--speaker-threshold`; if one person splits
 into several labels, lower it (CLI only; the app's **count** dropdown covers

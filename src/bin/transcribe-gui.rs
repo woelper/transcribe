@@ -9,8 +9,8 @@ use egui_phosphor::fill::{
 };
 use transcribe::diarize::SpeakerProfile;
 use transcribe::download::{
-    DIARIZATION_MODELS, SUMMARY_MODEL_FILE, SUMMARY_MODEL_SIZE, SUMMARY_MODEL_URL, WHISPER_MODELS,
-    model_by_name,
+    DIARIZATION_MODELS, SUMMARY_MODEL_FILE, SUMMARY_MODEL_SIZE, SUMMARY_MODEL_URL, VAD_MODEL_FILE,
+    VAD_MODEL_URL, SPEECH_MODELS, model_by_name,
 };
 use transcribe::recorder::{self, Recorder};
 use transcribe::{DiarizeModels, Options, Progress, SpeakerVoice, Transcript};
@@ -669,8 +669,10 @@ impl App {
         let Some(model_path) = self.model_path() else {
             return;
         };
-        let opts = Options {
+        let vad_model = models_dir.join(VAD_MODEL_FILE);
+        let mut opts = Options {
             model: model_path,
+            vad_model: Some(vad_model.clone()),
             prompt: transcribe::build_prompt(&self.vocabulary, &self.context),
             known_speakers: self.profiles.iter().map(|p| p.name.clone()).collect(),
             context: format!("{}\n{}", self.context, self.vocabulary),
@@ -693,6 +695,14 @@ impl App {
             Source::Recording { samples, .. } => Input::Samples(samples.clone()),
         };
         std::thread::spawn(move || {
+            // The VAD model is tiny; fetch it inline on first use. If that
+            // fails (offline), transcribe without it rather than giving up.
+            if !vad_model.exists() {
+                job.lock().unwrap().status = "downloading voice activity model ...".into();
+                if transcribe::download::download(VAD_MODEL_URL, &vad_model, |_, _| {}).is_err() {
+                    opts.vad_model = None;
+                }
+            }
             let progress = {
                 let job = job.clone();
                 move |progress: Progress| {
@@ -973,7 +983,7 @@ impl eframe::App for App {
                 };
             });
             ui.horizontal_wrapped(|ui| {
-                let labels: Vec<(String, String)> = WHISPER_MODELS
+                let labels: Vec<(String, String)> = SPEECH_MODELS
                     .iter()
                     .map(|m| {
                         let installed = self
@@ -1034,7 +1044,7 @@ impl eframe::App for App {
                 }
                 if ui
                     .button(format!("{BOOK_OPEN} Vocabulary…"))
-                    .on_hover_text("terms Whisper should spell correctly — product names, people, acronyms")
+                    .on_hover_text("terms Whisper should spell correctly — product names, people, acronyms (Whisper models only)")
                     .clicked()
                 {
                     self.show_vocabulary = !self.show_vocabulary;
@@ -1088,7 +1098,7 @@ impl eframe::App for App {
                     .margin(egui::Margin::symmetric(14, 12))
                     .hint_text(
                         "context for this recording — meeting name, speakers, topics, notes \
-                         (sent to the transcription along with the vocabulary)",
+                         (sent to Whisper models along with the vocabulary)",
                     ),
             );
         });

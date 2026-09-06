@@ -32,10 +32,13 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.16.0", features = ["metal"] }
 llama-cpp-2 = { version = "0.1.154", features = ["metal"] }
+# ggml runtime for non-Whisper speech models (NVIDIA Parakeet)
+transcribe-cpp = { version = "0.2.3", features = ["metal"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 whisper-rs = "0.16.0"
 llama-cpp-2 = "0.1.154"
+transcribe-cpp = { version = "0.2.3", default-features = false }
 
 # Local copy of ort-sys with its binary-download build dependency switched
 # from native-tls (openssl) to rustls, keeping the build openssl-free.

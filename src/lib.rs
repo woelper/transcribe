@@ -14,7 +14,10 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperVadContext,
+    WhisperVadContextParams, WhisperVadParams,
+};
 
 pub mod diarize;
 pub mod download;
@@ -22,6 +25,29 @@ pub mod recorder;
 pub mod summarize;
 
 pub const WHISPER_SAMPLE_RATE: usize = 16_000;
+
+/// Which inference engine a speech model runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// ggml Whisper models (`ggml-*.bin`) via whisper.cpp.
+    Whisper,
+    /// NVIDIA Parakeet (`*.gguf`) via transcribe.cpp.
+    Parakeet,
+}
+
+impl Engine {
+    /// Picked from the model file: whisper.cpp's models are `.bin`, the
+    /// transcribe.cpp ones are `.gguf`.
+    pub fn for_model(model: &Path) -> Engine {
+        match model.extension().and_then(|e| e.to_str()) {
+            Some(ext) if ext.eq_ignore_ascii_case("gguf") => Engine::Parakeet,
+            _ => Engine::Whisper,
+        }
+    }
+}
+
+/// One decoded segment: start and end in centiseconds, and its text.
+type RawSegment = (i64, i64, String);
 
 /// Nudges whisper toward punctuated, capitalized output (it otherwise tends
 /// to lock into an unpunctuated style when a file starts mid-sentence).
@@ -148,6 +174,11 @@ pub struct Options {
     /// Names mentioned here are treated like [`Options::known_speakers`]
     /// for prefix stripping, since they're what whisper mimics.
     pub context: String,
+    /// Silero VAD model for whisper.cpp (see [`download::VAD_MODEL_FILE`]).
+    /// When set, silence and noise are skipped before decoding, which
+    /// stops whisper hallucinating text for them; timestamps still refer
+    /// to the original audio. None decodes everything.
+    pub vad_model: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -163,6 +194,7 @@ impl Default for Options {
             diarize: None,
             known_speakers: Vec::new(),
             context: String::new(),
+            vad_model: None,
         }
     }
 }
@@ -314,8 +346,6 @@ where
     if samples.len() < min_len {
         samples.resize(min_len, 0.0);
     }
-    let audio_secs = samples.len() as f64 / WHISPER_SAMPLE_RATE as f64;
-
     let diarization = match &opts.diarize {
         Some(models) => {
             let t = Instant::now();
@@ -340,75 +370,21 @@ where
         None => None,
     };
 
-    // Route whisper.cpp/GGML logs away from stderr (no log backend => silenced).
-    whisper_rs::install_logging_hooks();
-
-    let mut ctx_params = WhisperContextParameters::default();
-    ctx_params.use_gpu(true);
-    let ctx = WhisperContext::new_with_params(&opts.model, ctx_params)
-        .with_context(|| format!("failed to load model {}", opts.model.display()))?;
-
-    let strategy = match opts.beam_size {
-        Some(n) if n > 1 => SamplingStrategy::BeamSearch {
-            beam_size: n,
-            patience: -1.0,
-        },
-        _ => SamplingStrategy::Greedy { best_of: 5 },
+    let progress = Arc::new(progress);
+    let raw_segments = match Engine::for_model(&opts.model) {
+        Engine::Whisper => run_whisper(&samples, opts, &progress)?,
+        Engine::Parakeet => run_parakeet(&samples, opts, &progress)?,
     };
 
-    let threads = opts.threads.unwrap_or_else(|| {
-        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        cores.min(8) as i32
-    });
-
-    let progress = Arc::new(progress);
-    let mut params = FullParams::new(strategy);
-    params.set_n_threads(threads);
-    params.set_language(Some(&opts.language));
-    params.set_initial_prompt(&opts.prompt);
-    params.set_translate(opts.translate);
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    let on_percent = progress.clone();
-    params.set_progress_callback_safe(move |percent: i32| {
-        on_percent(Progress::Transcribing { percent });
-    });
-    let on_segment = progress.clone();
-    params.set_segment_callback_safe_lossy(move |segment: whisper_rs::SegmentCallbackData| {
-        let text = segment.text.trim();
-        if !text.is_empty() {
-            on_segment(Progress::Segment { text: text.to_owned() });
-        }
-    });
-
-    let t1 = Instant::now();
-    let mut state = ctx.create_state()?;
-    state.full(params, &samples)?;
-    let transcribe_secs = t1.elapsed().as_secs_f64();
-    progress(Progress::Transcribed {
-        took_secs: transcribe_secs,
-        realtime_factor: audio_secs / transcribe_secs,
-    });
-
-    // First pass: collect segments and count repeated name-like leading
-    // prefixes — the signature of whisper mimicking a "Name: text" format.
-    let mut raw_segments: Vec<(i64, i64, String)> = Vec::new();
+    // First pass: count repeated name-like leading prefixes — the
+    // signature of whisper mimicking a "Name: text" format.
     let mut prefix_counts: HashMap<String, usize> = HashMap::new();
-    for segment in state.as_iter() {
-        let segment_text = segment.to_str_lossy()?;
-        let segment_text = segment_text.trim();
+    for (_, _, segment_text) in &raw_segments {
         if let Some(prefix) = leading_prefix(segment_text)
             && name_like(prefix)
         {
             *prefix_counts.entry(prefix.to_owned()).or_default() += 1;
         }
-        raw_segments.push((
-            segment.start_timestamp(),
-            segment.end_timestamp(),
-            segment_text.to_owned(),
-        ));
     }
     let frequent: std::collections::HashSet<String> = prefix_counts
         .into_iter()
@@ -442,7 +418,7 @@ where
             previous_line = segment_text.to_owned();
         }
         let speaker = diarization.as_ref().map(|diarization| {
-            // whisper timestamps are centiseconds, diarization uses seconds
+            // segment timestamps are centiseconds, diarization uses seconds
             let start = segment_start as f64 / 100.0;
             let end = segment_end as f64 / 100.0;
             match diarize::speaker_for_range(&diarization.segments, start, end) {
@@ -473,7 +449,278 @@ where
             text.push('\n');
         }
     }
+    finish_transcript(text, opts, diarization, speakers_seen, speaker_numbers)
+}
 
+/// CPU threads for decoding: what the user asked for, else up to 8 cores.
+fn thread_count(opts: &Options) -> i32 {
+    opts.threads.unwrap_or_else(|| {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        cores.min(8) as i32
+    })
+}
+
+/// Decode with whisper.cpp; returns the segments it produced.
+fn run_whisper<F>(samples: &[f32], opts: &Options, progress: &Arc<F>) -> Result<Vec<RawSegment>>
+where
+    F: Fn(Progress) + Send + Sync + 'static,
+{
+    let audio_secs = samples.len() as f64 / WHISPER_SAMPLE_RATE as f64;
+    // Route whisper.cpp/GGML logs away from stderr (no log backend => silenced).
+    whisper_rs::install_logging_hooks();
+
+    let mut ctx_params = WhisperContextParameters::default();
+    ctx_params.use_gpu(true);
+    let ctx = WhisperContext::new_with_params(&opts.model, ctx_params)
+        .with_context(|| format!("failed to load model {}", opts.model.display()))?;
+
+    let strategy = match opts.beam_size {
+        Some(n) if n > 1 => SamplingStrategy::BeamSearch {
+            beam_size: n,
+            patience: -1.0,
+        },
+        _ => SamplingStrategy::Greedy { best_of: 5 },
+    };
+
+    let threads = thread_count(opts);
+    let mut params = FullParams::new(strategy);
+    params.set_n_threads(threads);
+    params.set_language(Some(&opts.language));
+    params.set_initial_prompt(&opts.prompt);
+    params.set_translate(opts.translate);
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    if let Some(vad_model) = &opts.vad_model {
+        let path = vad_model.to_str().context("VAD model path is not valid UTF-8")?;
+        params.set_vad_model_path(Some(path));
+        params.enable_vad(true);
+    }
+    let on_percent = progress.clone();
+    params.set_progress_callback_safe(move |percent: i32| {
+        on_percent(Progress::Transcribing { percent });
+    });
+    let on_segment = progress.clone();
+    params.set_segment_callback_safe_lossy(move |segment: whisper_rs::SegmentCallbackData| {
+        let text = segment.text.trim();
+        if !text.is_empty() {
+            on_segment(Progress::Segment { text: text.to_owned() });
+        }
+    });
+
+    let t1 = Instant::now();
+    let mut state = ctx.create_state()?;
+    state.full(params, samples)?;
+    let transcribe_secs = t1.elapsed().as_secs_f64();
+    progress(Progress::Transcribed {
+        took_secs: transcribe_secs,
+        realtime_factor: audio_secs / transcribe_secs,
+    });
+
+    let mut raw_segments: Vec<RawSegment> = Vec::new();
+    for segment in state.as_iter() {
+        let segment_text = segment.to_str_lossy()?;
+        raw_segments.push((
+            segment.start_timestamp(),
+            segment.end_timestamp(),
+            segment_text.trim().to_owned(),
+        ));
+    }
+    Ok(raw_segments)
+}
+
+/// Decode with transcribe.cpp (NVIDIA Parakeet). The model has no
+/// prompt, so vocabulary/context are ignored; it also has no notion of
+/// sentences, so its word timestamps are regrouped into segments at
+/// pauses and sentence ends. Audio is fed in chunks of a few minutes cut
+/// at silences (found with the VAD model), which bounds memory on long
+/// recordings and gives progress updates.
+fn run_parakeet<F>(samples: &[f32], opts: &Options, progress: &Arc<F>) -> Result<Vec<RawSegment>>
+where
+    F: Fn(Progress) + Send + Sync + 'static,
+{
+    use transcribe_cpp::{Model, RunOptions, SessionOptions, TimestampKind};
+
+    if opts.translate {
+        bail!("translation needs a Whisper model; Parakeet only transcribes");
+    }
+    if opts.beam_size.is_some_and(|n| n > 1) {
+        bail!("beam search is a Whisper option; Parakeet decodes greedily");
+    }
+    static QUIET: std::sync::Once = std::sync::Once::new();
+    QUIET.call_once(transcribe_cpp::disable_logging);
+
+    let audio_secs = samples.len() as f64 / WHISPER_SAMPLE_RATE as f64;
+    let threads = thread_count(opts);
+    let model = Model::load(&opts.model)
+        .with_context(|| format!("failed to load model {}", opts.model.display()))?;
+    let mut session = model.session_with(&SessionOptions { n_threads: threads, ..SessionOptions::default() })?;
+    let run = RunOptions {
+        timestamps: TimestampKind::Word,
+        language: (opts.language != "auto").then(|| opts.language.clone()),
+        ..RunOptions::default()
+    };
+
+    let chunks = speech_chunks(samples, opts.vad_model.as_deref(), threads);
+    let t1 = Instant::now();
+    // (start ms, end ms, word)
+    let mut words: Vec<(i64, i64, String)> = Vec::new();
+    for &(start, end) in &chunks {
+        progress(Progress::Transcribing {
+            percent: (start * 100 / samples.len().max(1)) as i32,
+        });
+        let mut chunk = samples[start..end].to_vec();
+        let min_len = WHISPER_SAMPLE_RATE;
+        if chunk.len() < min_len {
+            chunk.resize(min_len, 0.0);
+        }
+        let result = session.run(&chunk, &run)?;
+        let offset_ms = (start as i64) * 1000 / WHISPER_SAMPLE_RATE as i64;
+        if result.words.is_empty() {
+            // No word alignment for this model build: keep the text as one
+            // block spanning the chunk.
+            let text = result.text.trim();
+            if !text.is_empty() {
+                let end_ms = (end as i64) * 1000 / WHISPER_SAMPLE_RATE as i64;
+                words.push((offset_ms, end_ms, text.to_owned()));
+            }
+            continue;
+        }
+        for word in result.words {
+            let text = word.text.trim();
+            if !text.is_empty() {
+                words.push((word.t0_ms + offset_ms, word.t1_ms + offset_ms, text.to_owned()));
+            }
+        }
+    }
+    let transcribe_secs = t1.elapsed().as_secs_f64();
+    progress(Progress::Transcribed {
+        took_secs: transcribe_secs,
+        realtime_factor: audio_secs / transcribe_secs,
+    });
+    Ok(group_words(&words))
+}
+
+/// Longest stretch of audio handed to Parakeet in one call. Its encoder
+/// attends over the whole input, so memory grows quadratically with it.
+const PARAKEET_CHUNK_SECS: f32 = 240.0;
+
+/// Split `samples` into chunks for Parakeet: speech spans found by the VAD
+/// model, padded a little and merged up to [`PARAKEET_CHUNK_SECS`], so cuts
+/// fall in silence. Without a VAD model (or if it finds nothing usable),
+/// fixed-length windows.
+fn speech_chunks(samples: &[f32], vad_model: Option<&Path>, threads: i32) -> Vec<(usize, usize)> {
+    let max_len = (PARAKEET_CHUNK_SECS * WHISPER_SAMPLE_RATE as f32) as usize;
+    let pad = WHISPER_SAMPLE_RATE / 4;
+    let spans = vad_model
+        .and_then(|model| vad_speech_spans(model, samples, threads).ok())
+        .map(|spans| {
+            spans
+                .into_iter()
+                .map(|(s, e)| (s.saturating_sub(pad), (e + pad).min(samples.len())))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![(0, samples.len())]);
+    merge_spans(&spans, max_len)
+}
+
+/// Speech spans (sample indices) according to whisper.cpp's Silero VAD.
+fn vad_speech_spans(model: &Path, samples: &[f32], threads: i32) -> Result<Vec<(usize, usize)>> {
+    let path = model.to_str().context("VAD model path is not valid UTF-8")?;
+    let mut params = WhisperVadContextParams::default();
+    params.set_n_threads(threads);
+    let mut vad = WhisperVadContext::new(path, params)
+        .with_context(|| format!("failed to load VAD model {}", model.display()))?;
+    let segments = vad.segments_from_samples(WhisperVadParams::default(), samples)?;
+    Ok(segments
+        .map(|segment| {
+            // whisper.cpp reports centiseconds
+            let to_sample = |cs: f32| ((cs / 100.0) * WHISPER_SAMPLE_RATE as f32) as usize;
+            (to_sample(segment.start), to_sample(segment.end).min(samples.len()))
+        })
+        .filter(|(s, e)| e > s)
+        .collect())
+}
+
+/// Join consecutive spans into chunks no longer than `max_len` samples
+/// (a chunk covers everything from its first span's start to its last
+/// span's end, silence included). A single span longer than `max_len`
+/// is cut into equal pieces.
+fn merge_spans(spans: &[(usize, usize)], max_len: usize) -> Vec<(usize, usize)> {
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let mut current: Option<(usize, usize)> = None;
+    for &(start, end) in spans {
+        current = match current {
+            Some((cs, _)) if end.saturating_sub(cs) <= max_len => Some((cs, end)),
+            Some(chunk) => {
+                chunks.push(chunk);
+                Some((start, end))
+            }
+            None => Some((start, end)),
+        };
+    }
+    chunks.extend(current);
+    chunks
+        .into_iter()
+        .flat_map(|(start, end)| {
+            let pieces = (end - start).div_ceil(max_len).max(1);
+            let piece_len = (end - start).div_ceil(pieces);
+            (0..pieces).map(move |i| {
+                let s = start + i * piece_len;
+                (s, (s + piece_len).min(end))
+            })
+        })
+        .filter(|(s, e)| e > s)
+        .collect()
+}
+
+/// Regroup timed words (milliseconds) into transcript segments: a new
+/// one starts after a pause of over a second, after a sentence end once the segment has
+/// some length, or when the segment gets long. Times are returned in
+/// centiseconds like whisper's.
+fn group_words(words: &[(i64, i64, String)]) -> Vec<RawSegment> {
+    const PAUSE_MS: i64 = 1_200;
+    const SENTENCE_MIN_MS: i64 = 4_000;
+    const MAX_MS: i64 = 20_000;
+    let mut segments: Vec<RawSegment> = Vec::new();
+    let mut current: Option<(i64, i64, String)> = None;
+    for (start, end, word) in words {
+        let flush = match &current {
+            Some((seg_start, seg_end, text)) => {
+                let ended_sentence = text.ends_with(['.', '?', '!']);
+                start - seg_end > PAUSE_MS
+                    || (ended_sentence && seg_end - seg_start >= SENTENCE_MIN_MS)
+                    || end - seg_start > MAX_MS
+            }
+            None => false,
+        };
+        if flush && let Some((s, e, text)) = current.take() {
+            segments.push((s / 10, e / 10, text));
+        }
+        match &mut current {
+            Some((_, seg_end, text)) => {
+                text.push(' ');
+                text.push_str(word);
+                *seg_end = (*end).max(*seg_end);
+            }
+            None => current = Some((*start, *end, word.clone())),
+        }
+    }
+    if let Some((s, e, text)) = current {
+        segments.push((s / 10, e / 10, text));
+    }
+    segments
+}
+
+/// Attach speaker bookkeeping to the formatted text.
+fn finish_transcript(
+    text: String,
+    opts: &Options,
+    diarization: Option<diarize::Diarization>,
+    speakers_seen: std::collections::HashSet<usize>,
+    speaker_numbers: HashMap<usize, usize>,
+) -> Result<Transcript> {
     let mut speaker_matches: Vec<(String, f32)> = diarization
         .as_ref()
         .map(|d| d.names.values().cloned().collect())
@@ -666,6 +913,36 @@ pub fn format_timestamp(centiseconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merges_speech_spans_into_bounded_chunks() {
+        // Three spans; the first two fit one chunk, the third starts a new one.
+        assert_eq!(merge_spans(&[(0, 40), (50, 90), (100, 150)], 100), vec![(0, 90), (100, 150)]);
+        // A single overlong span is cut into equal pieces.
+        assert_eq!(merge_spans(&[(0, 250)], 100), vec![(0, 84), (84, 168), (168, 250)]);
+        assert_eq!(merge_spans(&[], 100), Vec::<(usize, usize)>::new());
+    }
+
+    #[test]
+    fn groups_words_at_pauses_and_sentence_ends() {
+        let w = |s: i64, e: i64, t: &str| (s, e, t.to_owned());
+        let words = vec![
+            w(0, 300, "Hello"),
+            w(300, 600, "there."),
+            // short sentence: no break yet (under SENTENCE_MIN_MS)
+            w(700, 1000, "Still"),
+            w(1000, 1300, "going"),
+            // long pause -> new segment
+            w(3000, 3400, "After"),
+            w(3400, 3800, "pause."),
+        ];
+        let segments = group_words(&words);
+        assert_eq!(
+            segments,
+            vec![(0, 130, "Hello there. Still going".to_owned()), (300, 380, "After pause.".to_owned())]
+        );
+        assert!(group_words(&[]).is_empty());
+    }
 
     #[test]
     fn empty_vocabulary_keeps_default_prompt() {

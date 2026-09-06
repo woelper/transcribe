@@ -2,16 +2,18 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use transcribe::download::{VAD_MODEL_FILE, VAD_MODEL_URL};
 use transcribe::{DiarizeModels, Options, Progress};
 
-/// Transcribe an audio file locally with Whisper (Metal-accelerated).
+/// Transcribe an audio file locally with Whisper or Parakeet (Metal-accelerated).
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
     /// Input audio file (mp3, mp4/m4a, wav, flac, ogg, ...)
     audio: PathBuf,
 
-    /// Path to a ggml Whisper model (see download-model.sh)
+    /// Path to a speech model: a ggml Whisper .bin, or the Parakeet .gguf
+    /// (see download-model.sh)
     #[arg(short, long, default_value = "models/ggml-large-v3-turbo.bin")]
     model: PathBuf,
 
@@ -45,6 +47,11 @@ struct Args {
     /// if that file exists (see README)
     #[arg(short, long)]
     prompt: Option<String>,
+
+    /// Decode silence and noise too, instead of skipping them with voice
+    /// activity detection (the VAD model is fetched on first use)
+    #[arg(long)]
+    no_vad: bool,
 
     /// Detect speakers and prefix each segment with "Speaker N:"
     /// (needs the diarization models, see download-diarization-models.sh)
@@ -108,6 +115,21 @@ fn main() -> Result<()> {
         None => transcribe::prompt_with_vocabulary(&vocabulary),
     };
 
+    let vad_model = if args.no_vad {
+        None
+    } else {
+        let path = args
+            .model
+            .parent()
+            .map_or_else(|| PathBuf::from(VAD_MODEL_FILE), |dir| dir.join(VAD_MODEL_FILE));
+        if !path.exists() {
+            eprintln!("downloading voice activity model to {} ...", path.display());
+            transcribe::download::download(VAD_MODEL_URL, &path, |_, _| {})
+                .context("failed to download the VAD model (pass --no-vad to skip it)")?;
+        }
+        Some(path)
+    };
+
     let speakers_path = transcribe::speakers_path();
     let profiles = transcribe::load_speaker_profiles(&speakers_path)?;
     if args.diarize && !profiles.is_empty() {
@@ -128,6 +150,7 @@ fn main() -> Result<()> {
         timestamps: args.timestamps,
         known_speakers: profiles.iter().map(|p| p.name.clone()).collect(),
         context: vocabulary,
+        vad_model,
         diarize: args.diarize.then_some(DiarizeModels {
             segmentation_model: args.segmentation_model,
             embedding_model: args.embedding_model,
