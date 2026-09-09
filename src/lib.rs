@@ -21,6 +21,7 @@ use whisper_rs::{
     WhisperVadContextParams, WhisperVadParams,
 };
 
+pub mod applog;
 pub mod diarize;
 pub mod download;
 pub mod recorder;

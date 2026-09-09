@@ -7,6 +7,7 @@ default-run = "transcribe-gui"
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.5", features = ["derive"] }
+log = "0.4"
 cpal = "0.18.1"
 eframe = "0.35.0"
 egui-phosphor = { version = "0.13", default-features = false, features = ["fill"] }
@@ -51,7 +52,8 @@ strip = true         # strip symbols from the binary
 opt-level = "z"      # optimize for size
 lto = true           # fat LTO across all crates
 codegen-units = 1    # better optimization, slower compile
-panic = "abort"      # drop unwinding machinery
+# no panic = "abort": a panic must unwind so the hook can log it and worker
+# threads can report it instead of taking the whole app down
 
 # `./bundle.sh` builds Transcribe.app from the GUI binary (see README)
 [package.metadata.bundle.bin.transcribe-gui]

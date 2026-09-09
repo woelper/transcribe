@@ -4427,6 +4427,7 @@ dependencies = [
  "egui_kittest",
  "image",
  "llama-cpp-2",
+ "log",
  "ndarray",
  "ort",
  "pyannote-rs",

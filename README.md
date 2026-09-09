@@ -14,7 +14,10 @@ real names), and local transcript summaries. Nothing leaves your machine.
 
 Prebuilt apps for macOS, Linux, and Windows are on the
 [releases page](https://github.com/woelper/transcribe/releases). A released
-app downloads the models it needs into `~/.transcribe/models` on first use.
+app downloads the models it needs into `~/.transcribe/models` on first use,
+starting with the default speech model. It keeps a log, `transcribe.log`,
+next to the executable (for the macOS app: in `~/.transcribe/`) — if the
+app ever closes on its own, that file says why.
 
 ## The app
 
@@ -171,7 +174,8 @@ the repo or place a `models/` folder next to it.
 
 ## Command line
 
-The same engine is available as a CLI for scripting and batch work:
+The same engine is available as a CLI for scripting and batch work (built
+from source; it isn't part of the releases):
 
 ```sh
 ./target/release/transcribe recording.mp3                 # transcript to stdout

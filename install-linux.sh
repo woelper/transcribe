@@ -53,7 +53,7 @@ command -v update-desktop-database >/dev/null && update-desktop-database "$APP_D
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 
 echo "installed:"
-echo "  $BIN_DIR/transcribe-gui  (and transcribe)"
+echo "  $BIN_DIR/transcribe-gui"
 echo "  $APP_DIR/transcribe.desktop"
 echo "  $ICON_DIR/transcribe.png"
 echo "Transcribe should now appear in the app menu; log out and in if the icon doesn't update."

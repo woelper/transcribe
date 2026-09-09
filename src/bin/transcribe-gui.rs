@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"] // no console window behind the app on Windows
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,6 +24,17 @@ const MIC_PLIST_ERROR: &str = "error: this app bundle was built without micropho
     Rebuild the bundle with ./bundle.sh instead of `cargo bundle`";
 
 fn main() -> eframe::Result {
+    // Log file next to the exe (see applog), and every panic into it.
+    let log_path = transcribe::applog::init();
+    transcribe::applog::log_panics();
+    log::info!(
+        "transcribe-gui {} starting on {} {}; exe {:?}; log {:?}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::current_exe().ok(),
+        log_path
+    );
     // Same icon as the .app bundle; on macOS eframe applies it to the
     // Dock, so the binary looks right even when run outside the bundle.
     let icon = egui::IconData {
@@ -326,6 +339,23 @@ fn setup_theme(ctx: &egui::Context) {
     ctx.set_style_of(egui::Theme::Light, style);
 }
 
+/// Run a worker's body so that a panic in it becomes an error shown in
+/// the status bar (the panic hook has logged the details) instead of a
+/// dead thread and a UI waiting forever.
+fn guarded<T>(work: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            Err(anyhow::anyhow!("internal error: {message} (details in transcribe.log)"))
+        }
+    }
+}
+
 /// Turning a stopped recording into 16 kHz samples, off the UI thread.
 struct Finishing {
     fraction: f32,
@@ -458,17 +488,15 @@ impl App {
         let vocabulary_path = transcribe::vocabulary_path();
         let speakers_path = transcribe::speakers_path();
         let profiles = transcribe::load_speaker_profiles(&speakers_path).unwrap_or_default();
+        log::info!("models dir {models_dir:?}; {} enrolled speaker(s)", profiles.len());
         let status = match &models_dir {
             None => "error: models/ directory not found — run the download \
                 scripts and keep the app inside the repo (or put a models/ \
                 folder next to it)"
                 .into(),
-            Some(dir) if !dir.join(model_by_name(DEFAULT_MODEL).unwrap().file).exists() => {
-                "no speech model downloaded yet — pick one from the model dropdown".into()
-            }
             Some(_) => String::new(),
         };
-        Self {
+        let mut app = Self {
             source: None,
             devices: recorder::input_devices(),
             device: None,
@@ -506,7 +534,11 @@ impl App {
             source_transcribed: false,
             transcript_saved: true,
             confirm_discard: None,
-        }
+        };
+        // A fresh install has no model yet: fetch the default one right
+        // away instead of waiting for the user to pick one.
+        app.start_download_if_missing();
+        app
     }
 
     /// Enroll from an existing audio file, optionally restricted to a
@@ -537,7 +569,7 @@ impl App {
         }));
         self.enroll_job = Some(job.clone());
         std::thread::spawn(move || {
-            let result = (|| {
+            let result = guarded(|| {
                 let samples = transcribe::decode_to_mono_16k(&path)?;
                 let rate = 16_000f64;
                 let lo = (from.unwrap_or(0.0) * rate) as usize;
@@ -549,8 +581,8 @@ impl App {
                     &dir.join("segmentation-3.0.onnx"),
                     &dir.join("wespeaker_en_voxceleb_CAM++.onnx"),
                 )
-            })();
-            job.lock().unwrap().result = Some(result);
+            });
+            job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).result = Some(result);
         });
     }
 
@@ -559,7 +591,7 @@ impl App {
         let Some(job) = self.enroll_job.clone() else {
             return false;
         };
-        let mut job = job.lock().unwrap();
+        let mut job = job.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match job.result.take() {
             Some(Ok(embedding)) => {
                 self.profiles.retain(|p| p.name != job.name);
@@ -580,6 +612,7 @@ impl App {
                 false
             }
             Some(Err(e)) => {
+                log::error!("enrollment failed: {e:#}");
                 self.status = format!("error: enrollment failed: {e:#}");
                 self.enroll_job = None;
                 false
@@ -606,6 +639,7 @@ impl App {
         if self.download.is_some() {
             return;
         }
+        log::info!("downloading {what} from {url} to {}", path.display());
         let download = Arc::new(Mutex::new(Download {
             what,
             started: std::time::Instant::now(),
@@ -618,13 +652,13 @@ impl App {
             let progress = {
                 let download = download.clone();
                 move |done, total| {
-                    let mut download = download.lock().unwrap();
+                    let mut download = download.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     download.done = done;
                     download.total = total;
                 }
             };
-            let result = transcribe::download::download(&url, &path, progress);
-            download.lock().unwrap().result = Some(result);
+            let result = guarded(|| transcribe::download::download(&url, &path, progress));
+            download.lock().unwrap_or_else(std::sync::PoisonError::into_inner).result = Some(result);
         });
     }
 
@@ -669,22 +703,25 @@ impl App {
         }));
         self.download = Some(download.clone());
         std::thread::spawn(move || {
-            let mut result = Ok(());
-            for (path, url) in missing {
-                // Cumulative progress across both files; the combined size
-                // isn't known up front, so `total` stays None and the status
-                // line shows a plain MB counter.
-                let base = download.lock().unwrap().done;
-                let progress = {
-                    let download = download.clone();
-                    move |done, _total| download.lock().unwrap().done = base + done
-                };
-                result = transcribe::download::download(url, &path, progress);
-                if result.is_err() {
-                    break;
+            let worker = download.clone();
+            let result = guarded(move || {
+                for (path, url) in missing {
+                    // Cumulative progress across both files; the combined size
+                    // isn't known up front, so `total` stays None and the status
+                    // line shows a plain MB counter.
+                    let base = worker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).done;
+                    let progress = {
+                        let download = worker.clone();
+                        move |done, _total| {
+                            download.lock().unwrap_or_else(std::sync::PoisonError::into_inner).done =
+                                base + done
+                        }
+                    };
+                    transcribe::download::download(url, &path, progress)?;
                 }
-            }
-            download.lock().unwrap().result = Some(result);
+                Ok(())
+            });
+            download.lock().unwrap_or_else(std::sync::PoisonError::into_inner).result = Some(result);
         });
     }
 
@@ -718,16 +755,12 @@ impl App {
         std::thread::spawn(move || {
             let progress = {
                 let job = job.clone();
-                move |text: &str| job.lock().unwrap().live = text.to_owned()
+                move |text: &str| job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).live = text.to_owned()
             };
-            let result = transcribe::summarize::summarize(
-                &path,
-                &transcript,
-                &context,
-                &vocabulary,
-                &progress,
-            );
-            job.lock().unwrap().result = Some(result);
+            let result = guarded(|| {
+                transcribe::summarize::summarize(&path, &transcript, &context, &vocabulary, &progress)
+            });
+            job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).result = Some(result);
         });
     }
 
@@ -736,7 +769,7 @@ impl App {
         let Some(job) = self.summary_job.clone() else {
             return false;
         };
-        let mut job = job.lock().unwrap();
+        let mut job = job.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match job.result.take() {
             Some(Ok(summary)) => {
                 self.summary = summary;
@@ -745,6 +778,7 @@ impl App {
                 false
             }
             Some(Err(e)) => {
+                log::error!("summarization failed: {e:#}");
                 self.status = format!("error: summarization failed: {e:#}");
                 self.summary_job = None;
                 false
@@ -759,9 +793,10 @@ impl App {
     /// Collect download updates; returns the in-flight progress, if any.
     fn poll_download(&mut self) -> Option<(String, Option<f32>, Option<String>)> {
         let download = self.download.clone()?;
-        let mut download = download.lock().unwrap();
+        let mut download = download.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match download.result.take() {
             Some(Ok(())) => {
+                log::info!("{} downloaded", download.what);
                 self.status = format!("{} downloaded", download.what);
                 self.download = None;
                 // A "speakers" request made while this download was running
@@ -778,6 +813,7 @@ impl App {
                 None
             }
             Some(Err(e)) => {
+                log::error!("downloading {} failed: {e:#}", download.what);
                 self.status = format!("error: downloading {} failed: {e:#}", download.what);
                 self.download = None;
                 self.summarize_pending = false;
@@ -823,6 +859,13 @@ impl App {
         let Some(model_path) = self.model_path() else {
             return;
         };
+        log::info!(
+            "transcribing {} with {} (timestamps {}, speakers {})",
+            source.label(),
+            self.model,
+            self.timestamps,
+            self.diarize
+        );
         let vad_model = models_dir.join(VAD_MODEL_FILE);
         let mut opts = Options {
             model: model_path,
@@ -852,7 +895,7 @@ impl App {
             // The VAD model is tiny; fetch it inline on first use. If that
             // fails (offline), transcribe without it rather than giving up.
             if !vad_model.exists() {
-                job.lock().unwrap().status = "downloading voice activity model ...".into();
+                job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).status = "downloading voice activity model ...".into();
                 if transcribe::download::download(VAD_MODEL_URL, &vad_model, |_, _| {}).is_err() {
                     opts.vad_model = None;
                 }
@@ -860,7 +903,7 @@ impl App {
             let progress = {
                 let job = job.clone();
                 move |progress: Progress| {
-                    let mut job = job.lock().unwrap();
+                    let mut job = job.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     match progress {
                         Progress::Decoded { audio_secs, .. } => {
                             job.status = format!("decoded {audio_secs:.0}s of audio");
@@ -882,13 +925,13 @@ impl App {
                     }
                 }
             };
-            let result = match input {
+            let result = guarded(|| match input {
                 Input::File(path) => transcribe::transcribe(&path, &opts, progress),
                 Input::Samples(samples) => {
                     transcribe::transcribe_samples((*samples).clone(), &opts, progress)
                 }
-            };
-            job.lock().unwrap().result = Some(result);
+            });
+            job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).result = Some(result);
         });
     }
 
@@ -896,7 +939,7 @@ impl App {
     /// while it runs, and adopts the recording as the source when it's done.
     fn poll_finishing(&mut self) -> Option<(String, f32)> {
         let finishing = self.finishing.clone()?;
-        let mut finishing = finishing.lock().unwrap();
+        let mut finishing = finishing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let secs = finishing.secs;
         match finishing.result.take() {
             // Whisper hallucinates phrases like "Thank you." on silence,
@@ -920,6 +963,7 @@ impl App {
                 None
             }
             Some(Err(e)) => {
+                log::error!("finishing the recording failed: {e:#}");
                 self.finishing = None;
                 self.status = format!("error: {e:#}");
                 None
@@ -934,9 +978,14 @@ impl App {
     /// Collect worker updates; returns the current in-flight status, if any.
     fn poll_job(&mut self) -> Option<(String, Option<i32>, Option<String>)> {
         let job = self.job.clone()?;
-        let mut job = job.lock().unwrap();
+        let mut job = job.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match job.result.take() {
             Some(Ok(transcript)) => {
+                log::info!(
+                    "transcription done: {} chars, speakers {:?}",
+                    transcript.text.len(),
+                    transcript.speakers
+                );
                 self.source_transcribed = true;
                 self.transcript_saved = false;
                 self.transcript = transcript.text;
@@ -970,6 +1019,7 @@ impl App {
                 None
             }
             Some(Err(e)) => {
+                log::error!("transcription failed: {e:#}");
                 self.status = format!("error: {e:#}");
                 self.job = None;
                 None
@@ -1111,6 +1161,7 @@ impl App {
             }
             None => match Recorder::start(self.device.as_deref()) {
                 Ok(recorder) => {
+                    log::info!("recording from {:?}", self.device);
                     self.recorder = Some(recorder);
                     self.source = None;
                     self.transcript.clear();
@@ -1130,10 +1181,13 @@ impl App {
                 self.finishing = Some(finishing.clone());
                 self.status.clear();
                 std::thread::spawn(move || {
-                    let result = recording.into_16k(&mut |fraction| {
-                        finishing.lock().unwrap().fraction = fraction;
+                    let result = guarded(|| {
+                        recording.into_16k(&mut |fraction| {
+                            finishing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).fraction =
+                                fraction;
+                        })
                     });
-                    finishing.lock().unwrap().result = Some(result);
+                    finishing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).result = Some(result);
                 });
             }
         }

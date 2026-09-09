@@ -48,14 +48,12 @@ jobs:
           # ditto preserves the code signature and extended attributes
           ditto -c -k --keepParent target/release/bundle/osx/Transcribe.app \
             Transcribe-${{ matrix.target }}.zip
-          tar -czf transcribe-cli-${{ matrix.target }}.tar.gz \
-            -C target/release transcribe
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist/transcribe
-          cp target/release/transcribe target/release/transcribe-gui dist/transcribe/
+          cp target/release/transcribe-gui dist/transcribe/
           cp assets/linux/transcribe.desktop install-linux.sh dist/transcribe/
           cp assets/icon-256.png dist/transcribe/transcribe.png
           tar -czf transcribe-${{ matrix.target }}.tar.gz -C dist transcribe
@@ -64,8 +62,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path target/release/transcribe.exe, `
-            target/release/transcribe-gui.exe `
+          Compress-Archive -Path target/release/transcribe-gui.exe `
             -DestinationPath transcribe-${{ matrix.target }}.zip
 
       # release.sh puts AI-generated release notes into the annotated tag's
