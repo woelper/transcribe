@@ -21,9 +21,11 @@ app ever closes on its own, that file says why.
 
 ## The app
 
-- **Open audio…** loads an mp3, mp4/m4a, wav, flac, or ogg file (decoded in
-  Rust via symphonia, no ffmpeg needed), or hit **Record** to capture from
-  any audio input device.
+- **Open file…** loads an audio file (mp3, m4a, wav, flac, ogg) or a video
+  (mp4, mov, mkv, webm) — the soundtrack is decoded in Rust via symphonia, no
+  ffmpeg needed. Codecs symphonia lacks (Opus in webm/mkv screen recordings,
+  AC-3 in movie rips, avi) are handed to `ffmpeg` if it is installed. Or hit
+  **Record** to capture from any audio input device.
 - **Model dropdown** switches between models and downloads missing ones
   automatically. Whisper large-v3-turbo is the default: 99 languages, the
   best accuracy/speed tradeoff (~19x realtime on an M2 Pro), and the only
@@ -59,7 +61,7 @@ app ever closes on its own, that file says why.
 Speaker detection labels voices as `Speaker 1`, `Speaker 2`, … To get real
 names, enroll each person once: open **Speakers…**, type the name, and either
 record ~10 seconds of them talking naturally or pick an existing recording
-with **From audio file…** — optionally with a `from`/`to` time range
+with **From file…** — optionally with a `from`/`to` time range
 (`mm:ss`) pointing at a stretch where only that person speaks, e.g. their
 monologue in a meeting recording. The voice fingerprint is stored permanently
 in **`speakers.json`** and used by every future transcription — app and CLI —
@@ -181,6 +183,7 @@ from source; it isn't part of the releases):
 ./target/release/transcribe recording.mp3                 # transcript to stdout
 ./target/release/transcribe -o out.txt -t recording.m4a   # to file, with timestamps
 ./target/release/transcribe -d -t meeting.m4a             # with speaker labels
+./target/release/transcribe -t screencast.mkv             # video: the soundtrack is used
 ./target/release/transcribe -m models/parakeet-tdt-0.6b-v3-Q8_0.gguf talk.mp3   # Parakeet
 ```
 
@@ -210,7 +213,8 @@ Voices can also be enrolled from the command line:
 
 ## Pipeline
 
-1. Decode audio with symphonia (pure Rust)
+1. Decode audio with symphonia (pure Rust); the audio track of video files
+   works too, and codecs symphonia lacks fall back to ffmpeg when present
 2. Downmix to mono, resample to 16 kHz (rubato FFT resampler)
 3. With speaker detection: diarization (onnxruntime) — pyannote
    segmentation-3.0 splits the audio into speaker turns (including gapless

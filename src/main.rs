@@ -5,11 +5,13 @@ use clap::Parser;
 use transcribe::download::{VAD_MODEL_FILE, VAD_MODEL_URL};
 use transcribe::{DiarizeModels, Options, Progress};
 
-/// Transcribe an audio file locally with Whisper or Parakeet (Metal-accelerated).
+/// Transcribe an audio or video file locally with Whisper or Parakeet (Metal-accelerated).
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// Input audio file (mp3, mp4/m4a, wav, flac, ogg, ...)
+    /// Input audio or video file (mp3, m4a, wav, flac, ogg, mp4, mkv, webm,
+    /// ...). Codecs the built-in decoder lacks, such as Opus and AC-3, are
+    /// handed to ffmpeg if it is installed
     audio: PathBuf,
 
     /// Path to a speech model: a ggml Whisper .bin, or the Parakeet .gguf
