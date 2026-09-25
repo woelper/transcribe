@@ -17,7 +17,7 @@ use transcribe::download::{
     VAD_MODEL_URL, SPEECH_MODELS, model_by_name,
 };
 use transcribe::recorder::{self, Recorder};
-use transcribe::transcripts;
+use transcribe::{settings, transcripts};
 use transcribe::{DiarizeModels, Engine, Options, Progress, SpeakerVoice, Transcript};
 
 const DEFAULT_MODEL: &str = "large-v3-turbo";
@@ -484,6 +484,9 @@ struct App {
     /// history window opens and whenever a new one is saved.
     history: Vec<transcripts::Saved>,
     transcripts_dir: PathBuf,
+    /// What carries over to the next run (the chosen model).
+    settings: settings::Settings,
+    settings_path: PathBuf,
 }
 
 /// Auto mode's side of the app: the capture stream on this thread, the
@@ -530,6 +533,10 @@ impl App {
         let vocabulary_path = transcribe::vocabulary_path();
         let speakers_path = transcribe::speakers_path();
         let profiles = transcribe::load_speaker_profiles(&speakers_path).unwrap_or_default();
+        // Pick up where the last run left off.
+        let settings_path = settings::settings_path();
+        let settings = settings::load(&settings_path);
+        let model = remembered_model(&settings);
         log::info!("models dir {models_dir:?}; {} enrolled speaker(s)", profiles.len());
         let status = match &models_dir {
             None => "error: models/ directory not found — run the download \
@@ -554,7 +561,7 @@ impl App {
             vocabulary_path,
             show_vocabulary: false,
             context: String::new(),
-            model: DEFAULT_MODEL.into(),
+            model,
             download: None,
             show_speakers: false,
             max_speakers: None,
@@ -583,6 +590,8 @@ impl App {
             show_history: false,
             history: Vec::new(),
             transcripts_dir: transcripts::transcripts_dir(),
+            settings,
+            settings_path,
         };
         // A fresh install has no model yet: fetch the default one right
         // away instead of waiting for the user to pick one.
@@ -667,6 +676,19 @@ impl App {
                 false
             }
             None => true,
+        }
+    }
+
+    /// Keep the chosen model for the next run. A settings file that can't
+    /// be written is worth a line in the log, not an error in the user's
+    /// face — nothing about this run depends on it.
+    fn remember_model(&mut self) {
+        if self.settings.model.as_deref() == Some(self.model.as_str()) {
+            return;
+        }
+        self.settings.model = Some(self.model.clone());
+        if let Err(e) = settings::save(&self.settings_path, &self.settings) {
+            log::error!("could not save settings: {e:#}");
         }
     }
 
@@ -1644,6 +1666,7 @@ impl eframe::App for App {
                         });
                 });
                 if picked {
+                    self.remember_model();
                     self.start_download_if_missing();
                 }
                 toggle(ui, &mut self.timestamps, "timestamps");
@@ -2243,6 +2266,21 @@ impl eframe::App for App {
     }
 }
 
+/// The model to start with: the one the last run left behind, unless it
+/// isn't offered any more (renamed between versions, or a settings file
+/// from another build) — starting on a model that can't be loaded would
+/// be worse than starting on the default.
+fn remembered_model(settings: &settings::Settings) -> String {
+    match settings.model.as_deref() {
+        Some(name) if model_by_name(name).is_some() => name.to_owned(),
+        Some(name) => {
+            log::warn!("remembered model {name:?} is not offered any more; using the default");
+            DEFAULT_MODEL.to_owned()
+        }
+        None => DEFAULT_MODEL.to_owned(),
+    }
+}
+
 /// "30 s" / "1 min" / "5 min", for the silence-gap picker.
 fn format_gap(secs: f64) -> String {
     if secs < 60.0 {
@@ -2389,6 +2427,8 @@ mod tests {
                 super::setup_theme(&cc.egui_ctx);
                 let mut app = super::App::new();
                 app.models_dir = Some(fixture_models_dir());
+                // Not whatever model this machine last picked.
+                app.model = super::DEFAULT_MODEL.to_owned();
                 app.source = Some(super::Source::File("standup-2026-09-05.m4a".into()));
                 app.diarize = true;
                 app.context = "Weekly standup — Anna, Ben, Chris. Topics: \
@@ -2501,6 +2541,8 @@ mod tests {
                 super::setup_theme(&cc.egui_ctx);
                 let mut app = super::App::new();
                 app.models_dir = Some(fixture_models_dir());
+                // Not whatever model this machine last picked.
+                app.model = super::DEFAULT_MODEL.to_owned();
                 app.auto.on = true;
                 *app.auto.status.lock().unwrap() = transcribe::auto::Status {
                     phase: transcribe::auto::Phase::Recording,
@@ -2549,6 +2591,8 @@ mod tests {
                 super::setup_theme(&cc.egui_ctx);
                 let mut app = super::App::new();
                 app.models_dir = Some(fixture_models_dir());
+                // Not whatever model this machine last picked.
+                app.model = super::DEFAULT_MODEL.to_owned();
                 app.show_history = true;
                 app.history = vec![
                     saved(
@@ -2589,6 +2633,8 @@ mod tests {
                 super::setup_theme(&cc.egui_ctx);
                 let mut app = super::App::new();
                 app.models_dir = Some(fixture_models_dir());
+                // Not whatever model this machine last picked.
+                app.model = super::DEFAULT_MODEL.to_owned();
                 app.source = Some(super::Source::File("standup-2026-09-05.m4a".into()));
                 app
             });
@@ -2609,6 +2655,23 @@ mod tests {
         harness.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(700.0, 400.0)));
         harness.run();
         harness.snapshot("transcribe-gui-model-picker");
+    }
+
+    /// The model dropdown picks up where the last run left off — but a
+    /// remembered name that no longer exists must not strand the app on a
+    /// model it cannot load.
+    #[test]
+    fn the_last_picked_model_is_restored() {
+        use transcribe::settings::Settings;
+
+        let remembered = |model: Option<&str>| {
+            super::remembered_model(&Settings { model: model.map(str::to_owned) })
+        };
+        assert_eq!(remembered(None), super::DEFAULT_MODEL, "first run");
+        assert_eq!(remembered(Some("parakeet-tdt-0.6b-v3")), "parakeet-tdt-0.6b-v3");
+        assert_eq!(remembered(Some("tiny")), "tiny");
+        assert_eq!(remembered(Some("ggml-whisper-from-2023")), super::DEFAULT_MODEL);
+        assert_eq!(remembered(Some("")), super::DEFAULT_MODEL);
     }
 
     #[test]

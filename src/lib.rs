@@ -26,6 +26,7 @@ pub mod auto;
 pub mod diarize;
 pub mod download;
 pub mod recorder;
+pub mod settings;
 pub mod summarize;
 pub mod transcripts;
 

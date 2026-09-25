@@ -12,6 +12,7 @@
 .DS_*
 .claude/
 speakers.json
+settings.json
 # egui_kittest comparison artifacts (only the baseline .png is tracked)
 tests/snapshots/*.diff.png
 tests/snapshots/*.old.png
