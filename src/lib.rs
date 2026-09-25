@@ -300,6 +300,13 @@ pub struct Transcript {
     /// enrolled name) — lets a label be renamed afterwards and the voice
     /// enrolled under the new name.
     pub speaker_voices: Vec<SpeakerVoice>,
+    /// Stretches of speech the model gave up on part-way, having hit its
+    /// decoder context before reaching the end — normally a repetition
+    /// loop on music or noise. What it managed to decode is included, so
+    /// the transcript is missing words rather than missing the stretch,
+    /// which is worth saying out loud: it looks complete otherwise.
+    /// Always 0 for Whisper models, which cap generation per window.
+    pub incomplete: usize,
 }
 
 /// A speaker as they appear in a finished transcript: the label used in
@@ -384,8 +391,8 @@ where
     };
 
     let progress = Arc::new(progress);
-    let raw_segments = match Engine::for_model(&opts.model) {
-        Engine::Whisper => run_whisper(&samples, opts, &progress)?,
+    let (raw_segments, incomplete) = match Engine::for_model(&opts.model) {
+        Engine::Whisper => (run_whisper(&samples, opts, &progress)?, 0),
         Engine::TranscribeCpp => run_transcribe_cpp(&samples, opts, &progress)?,
     };
 
@@ -462,7 +469,7 @@ where
             text.push('\n');
         }
     }
-    finish_transcript(text, opts, diarization, speakers_seen, speaker_numbers)
+    finish_transcript(text, opts, diarization, speakers_seen, speaker_numbers, incomplete)
 }
 
 /// CPU threads for decoding: what the user asked for, else up to 8 cores.
@@ -550,11 +557,13 @@ where
 /// minutes and their word timestamps are regrouped into segments at
 /// pauses and sentence ends; models without any timestamps (Qwen3-ASR)
 /// decode each stretch of speech on its own, timed by the VAD boundaries.
+/// Returns the decoded segments and how many stretches were cut short by
+/// the decoder's context limit (see [`Transcript::incomplete`]).
 fn run_transcribe_cpp<F>(
     samples: &[f32],
     opts: &Options,
     progress: &Arc<F>,
-) -> Result<Vec<RawSegment>>
+) -> Result<(Vec<RawSegment>, usize)>
 where
     F: Fn(Progress) + Send + Sync + 'static,
 {
@@ -598,6 +607,7 @@ where
     // (start ms, end ms, text): words for aligned models, else one entry
     // per decoded stretch of speech.
     let mut pieces: Vec<(i64, i64, String)> = Vec::new();
+    let mut incomplete = 0usize;
     for &(start, end) in &chunks {
         progress(Progress::Transcribing {
             percent: (start * 100 / samples.len().max(1)) as i32,
@@ -606,7 +616,38 @@ where
         if chunk.len() < WHISPER_SAMPLE_RATE {
             chunk.resize(WHISPER_SAMPLE_RATE, 0.0);
         }
-        let result = session.run(&chunk, &run)?;
+        // One stretch can run the decoder out of context — usually because
+        // the model fell into a repetition loop on music or noise. The
+        // library hands back what it decoded before giving up, so that
+        // stretch is all that is lost: hours of already-decoded audio must
+        // not go with it.
+        let result = match session.run(&chunk, &run) {
+            Ok(result) => result,
+            Err(
+                transcribe_cpp::Error::OutputTruncated { partial, message }
+                | transcribe_cpp::Error::Aborted { partial, message },
+            ) => {
+                incomplete += 1;
+                log::warn!(
+                    "the stretch at {} was cut short by the model's limit ({message}); \
+                     it produced {} characters before giving up",
+                    format_duration(start as f64 / WHISPER_SAMPLE_RATE as f64),
+                    partial.as_ref().map_or(0, |p| p.text.trim().len()),
+                );
+                // Nothing at all came back for it: skip the stretch rather
+                // than lose the whole transcription over it.
+                let Some(partial) = partial else { continue };
+                *partial
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "decoding the stretch at {} failed",
+                        format_duration(start as f64 / WHISPER_SAMPLE_RATE as f64)
+                    )
+                });
+            }
+        };
         let offset_ms = to_ms(start);
         if !word_timed || result.words.is_empty() {
             let text = result.text.trim();
@@ -627,11 +668,12 @@ where
         took_secs: transcribe_secs,
         realtime_factor: audio_secs / transcribe_secs,
     });
-    if word_timed {
-        Ok(group_words(&pieces))
+    let segments = if word_timed {
+        group_words(&pieces)
     } else {
-        Ok(pieces.into_iter().map(|(s, e, text)| (s / 10, e / 10, text)).collect())
-    }
+        pieces.into_iter().map(|(s, e, text)| (s / 10, e / 10, text)).collect()
+    };
+    Ok((segments, incomplete))
 }
 
 /// Longest stretch handed to a word-aligned model (Parakeet) in one call.
@@ -764,6 +806,7 @@ fn finish_transcript(
     diarization: Option<diarize::Diarization>,
     speakers_seen: std::collections::HashSet<usize>,
     speaker_numbers: HashMap<usize, usize>,
+    incomplete: usize,
 ) -> Result<Transcript> {
     let mut speaker_matches: Vec<(String, f32)> = diarization
         .as_ref()
@@ -799,6 +842,7 @@ fn finish_transcript(
         speaker_matches,
         weak_matches: diarization.map(|d| d.weak_matches).unwrap_or_default(),
         speaker_voices,
+        incomplete,
     })
 }
 

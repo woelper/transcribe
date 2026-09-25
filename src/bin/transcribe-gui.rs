@@ -1228,6 +1228,14 @@ impl App {
                     Some(n) => format!("done — {n} speaker(s) detected"),
                     None => "done".into(),
                 };
+                // A transcript with holes in it must not look finished.
+                if transcript.incomplete > 0 {
+                    status.push_str(&format!(
+                        " — warning: {} stretch(es) ran past what {} can decode in one go \
+                         and are missing words; a Whisper model handles those better",
+                        transcript.incomplete, self.model
+                    ));
+                }
                 if !transcript.speaker_matches.is_empty() {
                     let names: Vec<String> = transcript
                         .speaker_matches

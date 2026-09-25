@@ -180,6 +180,13 @@ fn main() -> Result<()> {
     if let Some(speakers) = transcript.speakers {
         eprintln!("{speakers} speaker(s) in the transcript");
     }
+    if transcript.incomplete > 0 {
+        eprintln!(
+            "warning: {} stretch(es) ran past what this model can decode in one go and \
+             are missing words (see transcribe.log); a Whisper model handles those better",
+            transcript.incomplete
+        );
+    }
     let similarities = |matches: &[(String, f32)]| -> String {
         matches
             .iter()
