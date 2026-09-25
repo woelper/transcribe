@@ -22,10 +22,12 @@ use whisper_rs::{
 };
 
 pub mod applog;
+pub mod auto;
 pub mod diarize;
 pub mod download;
 pub mod recorder;
 pub mod summarize;
+pub mod transcripts;
 
 pub const WHISPER_SAMPLE_RATE: usize = 16_000;
 
@@ -845,9 +847,33 @@ fn strip_hallucinated_prefix<'a>(
     t
 }
 
-/// Decode any supported audio file to 16 kHz mono f32 PCM (whisper's input format).
+/// Decode any supported audio or video file to 16 kHz mono f32 PCM
+/// (whisper's input format).
+///
+/// symphonia (pure Rust) handles the codecs it knows — mp3, AAC, FLAC,
+/// Vorbis, PCM — in any of its containers: mp3, mp4/m4a/mov, mkv/webm,
+/// ogg, wav, flac. Video files work the same way; the video track is
+/// skipped. Anything it can't decode (Opus in a webm, AC-3 in a movie
+/// rip, avi, ...) falls back to an `ffmpeg` binary, if one is installed.
 pub fn decode_to_mono_16k(path: &Path) -> Result<Vec<f32>> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let err = match decode_with_symphonia(path, file) {
+        Ok(samples) => return Ok(samples),
+        Err(err) => err,
+    };
+    let Some(ffmpeg) = find_ffmpeg() else {
+        return Err(err.context(
+            "no built-in decoder for this file; install ffmpeg (used as a fallback \
+             for codecs like Opus and AC-3) or convert it to mp3/m4a/wav first",
+        ));
+    };
+    log::info!("symphonia couldn't decode {}: {err:#}; trying ffmpeg", path.display());
+    decode_with_ffmpeg(&ffmpeg, path)
+        .with_context(|| format!("{err:#}; the ffmpeg fallback failed too"))
+}
+
+/// Decode with symphonia's built-in demuxers and codecs.
+fn decode_with_symphonia(path: &Path, file: File) -> Result<Vec<f32>> {
     let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
 
     let mut hint = Hint::new();
@@ -927,6 +953,75 @@ pub fn decode_to_mono_16k(path: &Path) -> Result<Vec<f32>> {
     } else {
         resample_to_16k(&mono, rate as usize)
     }
+}
+
+/// Locate an ffmpeg binary: on PATH, or in the usual Homebrew/MacPorts
+/// prefixes, which a double-clicked .app bundle doesn't have on its PATH.
+pub fn find_ffmpeg() -> Option<PathBuf> {
+    let candidates = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"].map(PathBuf::from));
+    let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    candidates.map(|dir| dir.join(exe)).find(|p| p.is_file())
+}
+
+/// Have ffmpeg demux and decode the first audio stream, downmixed to mono
+/// and resampled to 16 kHz, streaming raw f32 samples over a pipe.
+fn decode_with_ffmpeg(ffmpeg: &Path, path: &Path) -> Result<Vec<f32>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(ffmpeg)
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-vn", "-sn", "-dn", "-ac", "1", "-ar"])
+        .arg(WHISPER_SAMPLE_RATE.to_string())
+        .args(["-f", "f32le", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to run {}", ffmpeg.display()))?;
+
+    // Drain stderr on its own thread so a chatty ffmpeg can't fill that
+    // pipe and stall while we're blocked reading stdout.
+    let mut stderr = child.stderr.take().context("no ffmpeg stderr")?;
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+
+    let mut stdout = child.stdout.take().context("no ffmpeg stdout")?;
+    let mut samples: Vec<f32> = Vec::new();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut carry: Vec<u8> = Vec::new();
+    loop {
+        let n = stdout.read(&mut buf).context("error reading ffmpeg output")?;
+        if n == 0 {
+            break;
+        }
+        carry.extend_from_slice(&buf[..n]);
+        let whole = carry.len() / 4 * 4;
+        samples.extend(
+            carry[..whole]
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        );
+        carry.drain(..whole);
+    }
+
+    let status = child.wait().context("failed to wait for ffmpeg")?;
+    let stderr_text = stderr_reader.join().unwrap_or_default();
+    if !status.success() {
+        bail!("ffmpeg exited with {status}: {}", stderr_text.trim());
+    }
+    if samples.is_empty() {
+        bail!("ffmpeg produced no audio: {}", stderr_text.trim());
+    }
+    Ok(samples)
 }
 
 /// Resample mono PCM from the given rate to 16 kHz.
@@ -1009,6 +1104,17 @@ pub fn format_timestamp(centiseconds: i64) -> String {
         ms % 1_000,
     );
     format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+}
+
+/// Format a length of time as `MM:SS`, or `H:MM:SS` past an hour.
+pub fn format_duration(secs: f64) -> String {
+    let total = secs.max(0.0).round() as i64;
+    let (h, m, s) = (total / 3600, (total / 60) % 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
 }
 
 #[cfg(test)]

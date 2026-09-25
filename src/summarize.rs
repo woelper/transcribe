@@ -92,6 +92,132 @@ pub fn summarize(
     vocabulary: &str,
     on_progress: &dyn Fn(&str),
 ) -> Result<String> {
+    let build_user = |transcript: &str| {
+        let mut user = String::new();
+        if !context.trim().is_empty() {
+            user.push_str(&format!("Notes about the recording:\n{context}\n\n"));
+        }
+        let terms = crate::vocabulary_terms(vocabulary);
+        if !terms.is_empty() {
+            user.push_str(&format!(
+                "Names and terms, spelled as they should appear: {}\n\n",
+                terms.join(", ")
+            ));
+        }
+        user.push_str(&format!("Summarize this transcript:\n\n{transcript}"));
+        user
+    };
+    generate(
+        model_path,
+        SYSTEM_PROMPT,
+        &build_user,
+        transcript,
+        N_CTX,
+        MAX_OUTPUT_TOKENS,
+        on_progress,
+    )
+}
+
+/// A finished meeting's name and one-line gist, from the same model that
+/// writes the long summaries.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Label {
+    pub title: String,
+    pub summary: String,
+}
+
+const LABEL_SYSTEM_PROMPT: &str = "You label meeting transcripts. Reply with \
+    exactly two lines and nothing else:\n\
+    Title: a specific name for this meeting, at most six words, no quotes\n\
+    Summary: one sentence, at most 25 words, saying what it was about\n\
+    Name the actual subject rather than the format — \"Q3 budget and \
+    hiring freeze\", not \"Team meeting\". Write both in the language the \
+    transcript is written in.";
+
+/// Naming a meeting only needs its shape, not every word, so it runs over
+/// a much smaller window than a full summary — which keeps it to seconds
+/// even on a CPU.
+const LABEL_N_CTX: u32 = 8192;
+const LABEL_MAX_OUTPUT_TOKENS: usize = 128;
+
+/// Title and one-sentence gist for a finished transcript.
+pub fn label(model_path: &Path, transcript: &str, vocabulary: &str) -> Result<Label> {
+    let build_user = |transcript: &str| {
+        let mut user = String::new();
+        let terms = crate::vocabulary_terms(vocabulary);
+        if !terms.is_empty() {
+            user.push_str(&format!(
+                "Names and terms, spelled as they should appear: {}\n\n",
+                terms.join(", ")
+            ));
+        }
+        user.push_str(&format!("Label this transcript:\n\n{transcript}"));
+        user
+    };
+    let text = generate(
+        model_path,
+        LABEL_SYSTEM_PROMPT,
+        &build_user,
+        transcript,
+        LABEL_N_CTX,
+        LABEL_MAX_OUTPUT_TOKENS,
+        &|_| {},
+    )?;
+    let label = parse_label(&text);
+    if label.title.is_empty() {
+        // Nothing usable came back — worth seeing verbatim, since the
+        // fallback (filing under the date alone) hides the reason.
+        log::warn!("labelling produced no title; the model answered {text:?}");
+    }
+    Ok(label)
+}
+
+/// Pull the two labelled lines out of the model's answer, tolerating the
+/// ways a small model strays: markdown bullets, bold keys, quotes, or
+/// just the bare title on the first line.
+fn parse_label(text: &str) -> Label {
+    let mut label = Label::default();
+    for line in text.lines() {
+        let line = line.trim().trim_start_matches(['-', '*', '#']).trim();
+        let line = line.replace("**", "");
+        let Some((key, value)) = line.split_once(':') else { continue };
+        let value = value.trim().trim_matches(['"', '\'', '*']).trim();
+        match key.trim().to_ascii_lowercase().as_str() {
+            "title" if label.title.is_empty() => label.title = value.to_owned(),
+            "summary" if label.summary.is_empty() => label.summary = value.to_owned(),
+            _ => {}
+        }
+    }
+    if label.title.is_empty() {
+        // No keys at all: take the first line as the title, the rest as
+        // the summary.
+        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+        label.title = lines
+            .next()
+            .unwrap_or_default()
+            .trim_matches(['"', '#', '*', ' '])
+            .to_owned();
+        if label.summary.is_empty() {
+            label.summary = lines.collect::<Vec<_>>().join(" ");
+        }
+    }
+    // A title is a name, not a sentence.
+    label.title = label.title.trim_end_matches('.').trim().to_owned();
+    label
+}
+
+/// Run one chat-model generation: load the model, fit the prompt into the
+/// context window (trimming the transcript's middle when it doesn't fit),
+/// decode, and stream the answer to `on_progress`.
+fn generate(
+    model_path: &Path,
+    system: &str,
+    build_user: &dyn Fn(&str) -> String,
+    transcript: &str,
+    n_ctx: u32,
+    max_output: usize,
+    on_progress: &dyn Fn(&str),
+) -> Result<String> {
     anyhow::ensure!(!transcript.trim().is_empty(), "nothing to summarize");
     let backend = backend()?;
 
@@ -105,34 +231,30 @@ pub fn summarize(
         .chat_template(None)
         .map_err(|e| anyhow!("the model has no chat template: {e}"))?;
 
+    // A reasoning model would spend the whole token budget thinking
+    // before writing a word — for summarizing and titling there is
+    // nothing to reason about. Opening the answer with an already-closed
+    // thinking block is how these templates are told to skip it.
+    let thinks = template
+        .to_str()
+        .is_ok_and(|template| template.contains("<think>"));
+    let skip_thinking = if thinks { "<think>\n\n</think>\n\n" } else { "" };
+
     // Fit the prompt into the context window, trimming the transcript
     // middle if needed. Token counts only shrink roughly linearly with
     // bytes, so re-check after each cut.
-    let budget = N_CTX as usize - MAX_OUTPUT_TOKENS - 64;
+    let budget = n_ctx as usize - max_output - 64;
     let mut keep = transcript.len();
     let tokens = loop {
-        let mut user = String::new();
-        if !context.trim().is_empty() {
-            user.push_str(&format!("Notes about the recording:\n{context}\n\n"));
-        }
-        let terms = crate::vocabulary_terms(vocabulary);
-        if !terms.is_empty() {
-            user.push_str(&format!(
-                "Names and terms, spelled as they should appear: {}\n\n",
-                terms.join(", ")
-            ));
-        }
-        user.push_str(&format!(
-            "Summarize this transcript:\n\n{}",
-            trimmed(transcript, keep)
-        ));
+        let user = build_user(&trimmed(transcript, keep));
         let messages = vec![
-            LlamaChatMessage::new("system".into(), SYSTEM_PROMPT.into())?,
+            LlamaChatMessage::new("system".into(), system.into())?,
             LlamaChatMessage::new("user".into(), user)?,
         ];
         let prompt = model
             .apply_chat_template(&template, &messages, true)
-            .map_err(|e| anyhow!("applying the chat template failed: {e}"))?;
+            .map_err(|e| anyhow!("applying the chat template failed: {e}"))?
+            + skip_thinking;
         let tokens = model.str_to_token(&prompt, AddBos::Always)?;
         if tokens.len() <= budget {
             break tokens;
@@ -143,7 +265,7 @@ pub fn summarize(
 
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get() as i32);
     let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(std::num::NonZeroU32::new(N_CTX))
+        .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
         .with_n_batch(N_BATCH as u32)
         .with_n_threads(threads)
         .with_n_threads_batch(threads);
@@ -172,7 +294,7 @@ pub fn summarize(
     ]);
     // Bytes, not a String: a multi-byte char can span two tokens.
     let mut out: Vec<u8> = Vec::new();
-    for _ in 0..MAX_OUTPUT_TOKENS {
+    for _ in 0..max_output {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(token);
         if model.is_eog_token(token) {

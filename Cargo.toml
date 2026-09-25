@@ -6,6 +6,9 @@ default-run = "transcribe-gui"
 
 [dependencies]
 anyhow = "1.0.104"
+# Local date and time for naming and dating saved meetings. No default
+# features: the oldtime/serde baggage isn't needed, `clock` is.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.6.5", features = ["derive"] }
 log = "0.4"
 cpal = "0.18.1"

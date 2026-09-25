@@ -26,6 +26,9 @@ app ever closes on its own, that file says why.
   ffmpeg needed. Codecs symphonia lacks (Opus in webm/mkv screen recordings,
   AC-3 in movie rips, avi) are handed to `ffmpeg` if it is installed. Or hit
   **Record** to capture from any audio input device.
+- **auto** listens by itself and files every meeting it hears, named after
+  what was said (see [Auto mode](#auto-mode)). **History…** lists what it
+  has filed.
 - **Model dropdown** switches between models and downloads missing ones
   automatically. Whisper large-v3-turbo is the default: 99 languages, the
   best accuracy/speed tradeoff (~19x realtime on an M2 Pro), and the only
@@ -55,6 +58,50 @@ app ever closes on its own, that file says why.
   on first use).
 - The transcript is editable in place; **Save transcript…** writes it via a
   file dialog.
+
+### Auto mode
+
+Switch **auto** on and the app listens on its own. It waits for someone to
+start talking, records what follows as a meeting, transcribes it in pieces
+while it is still running — so the text appears as people speak — and when
+the room goes quiet for good, names the meeting after its contents and files
+it away. Then it goes back to waiting. You never press Record.
+
+A meeting survives its pauses. Silence only ends one after the gap set
+beside the toggle (**1 minute** by default, up to 5), so reading a document,
+waiting for someone to join, or a break between agenda items keeps the same
+meeting running rather than scattering it across a dozen files. A cough, a
+door, or a passing "back in five" never starts one: it takes over a second
+of speech to begin, and under eight seconds of talking in total is thrown
+away as noise rather than filed.
+
+Finished meetings go to **`transcripts/`** (next to `models/`, or
+`~/.transcribe/transcripts` for a released app), one text file each:
+
+```
+Title: Q3 data centre budget and migration ownership
+Date: 2026-09-17 14:32
+Duration: 48:12
+Summary: The team settled on 400,000 euros and gave Sarah the migration,
+with vendor contracts due at the end of the month.
+
+----------------------------------------------------------------
+
+Good morning everyone, thanks for joining the quarterly planning call.
+...
+```
+
+The title and the summary line come from the same local model the
+**Summarize** button uses (Qwen3.5 4B). Without it downloaded, meetings are
+still recorded and filed — just under their date alone. **History…** lists
+everything filed, newest first, and opens any of them back into the editor.
+
+Auto mode holds only the audio it hasn't transcribed yet, so listening all
+day costs a bounded amount of memory and writes no audio files. Speaker
+detection stays off while it runs (it needs the whole recording to tell
+voices apart); run a finished transcript through **Transcribe** with
+**speakers** on if you need labels. Closing the window while a meeting is in
+progress finishes and files it first.
 
 ### Naming speakers (voice enrollment)
 

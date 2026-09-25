@@ -6,15 +6,18 @@ use std::time::Duration;
 
 use eframe::egui;
 use egui_phosphor::fill::{
-    ARROWS_CLOCKWISE, BOOK_OPEN, CHECK, COPY, DOWNLOAD_SIMPLE, FLOPPY_DISK, FOLDER_OPEN,
-    LIST_BULLETS, MICROPHONE, NOTE_PENCIL, RECORD, STOP, TRASH, USERS, WARNING,
+    ARROWS_CLOCKWISE, BOOK_OPEN, BROADCAST, CHECK, CLOCK_COUNTER_CLOCKWISE, COPY, DOWNLOAD_SIMPLE,
+    EAR, FLOPPY_DISK, FOLDER_OPEN, LIST_BULLETS, MICROPHONE, NOTE_PENCIL, RECORD, STOP, TRASH,
+    USERS, WARNING,
 };
+use transcribe::auto;
 use transcribe::diarize::SpeakerProfile;
 use transcribe::download::{
     DIARIZATION_MODELS, SUMMARY_MODEL_FILE, SUMMARY_MODEL_SIZE, SUMMARY_MODEL_URL, VAD_MODEL_FILE,
     VAD_MODEL_URL, SPEECH_MODELS, model_by_name,
 };
 use transcribe::recorder::{self, Recorder};
+use transcribe::transcripts;
 use transcribe::{DiarizeModels, Engine, Options, Progress, SpeakerVoice, Transcript};
 
 const DEFAULT_MODEL: &str = "large-v3-turbo";
@@ -370,6 +373,16 @@ enum Discard {
     OpenFile,
 }
 
+/// Extensions offered by the file dialogs. Containers symphonia demuxes
+/// itself plus common video ones; codecs it lacks fall back to ffmpeg
+/// (see `transcribe::decode_to_mono_16k`).
+const AUDIO_EXTENSIONS: &[&str] = &["mp3", "m4a", "aac", "wav", "flac", "ogg", "oga", "opus", "wma"];
+const VIDEO_EXTENSIONS: &[&str] = &["mkv", "webm", "mp4", "m4v", "mov", "avi", "ts", "wmv"];
+const MEDIA_EXTENSIONS: &[&str] = &[
+    "mp3", "m4a", "aac", "wav", "flac", "ogg", "oga", "opus", "wma", "mkv", "webm", "mp4", "m4v",
+    "mov", "avi", "ts", "wmv",
+];
+
 /// What gets transcribed: a loaded file or an in-memory recording.
 enum Source {
     File(PathBuf),
@@ -464,6 +477,35 @@ struct App {
     /// Which action is waiting for the user to confirm discarding an
     /// untranscribed recording.
     confirm_discard: Option<Discard>,
+    /// Auto mode: listening for meetings on its own.
+    auto: Auto,
+    show_history: bool,
+    /// Meetings auto mode has filed, newest first; re-read when the
+    /// history window opens and whenever a new one is saved.
+    history: Vec<transcripts::Saved>,
+    transcripts_dir: PathBuf,
+}
+
+/// Auto mode's side of the app: the capture stream on this thread, the
+/// worker that turns it into filed meetings, and what it reports back.
+#[derive(Default)]
+struct Auto {
+    /// Set while the toggle is on. The worker can still be finishing a
+    /// meeting after this goes false.
+    on: bool,
+    /// Capture stream. Lives here because a cpal stream can't move
+    /// between threads, and it owns the channel to the worker — so
+    /// dropping it both stops the input and tells the worker to finish.
+    recorder: Option<Recorder>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    status: Arc<Mutex<auto::Status>>,
+    /// Last live transcript mirrored into the editor, so the editor is
+    /// only overwritten when the worker actually produced new text.
+    mirrored: String,
+    /// Silence that ends a meeting, in seconds.
+    gap_secs: f64,
+    /// Meetings filed this session, to notice when to re-read the history.
+    saved: usize,
 }
 
 /// A file-based enrollment running in a background thread (decoding and
@@ -534,6 +576,13 @@ impl App {
             source_transcribed: false,
             transcript_saved: true,
             confirm_discard: None,
+            auto: Auto {
+                gap_secs: auto::Config::default().gap_secs,
+                ..Auto::default()
+            },
+            show_history: false,
+            history: Vec::new(),
+            transcripts_dir: transcripts::transcripts_dir(),
         };
         // A fresh install has no model yet: fetch the default one right
         // away instead of waiting for the user to pick one.
@@ -935,6 +984,168 @@ impl App {
         });
     }
 
+    /// Start listening: open the input and hand it to an [`auto`] worker
+    /// that groups what it hears into meetings and files each one.
+    fn start_auto(&mut self) {
+        if !mic_usage_declared() {
+            self.status = MIC_PLIST_ERROR.into();
+            self.auto.on = false;
+            return;
+        }
+        let Some(models_dir) = self.models_dir.clone() else {
+            self.status = "error: models/ directory not found — cannot listen".into();
+            self.auto.on = false;
+            return;
+        };
+        match self.model_path() {
+            Some(path) if path.exists() => {}
+            _ => {
+                self.status = format!(
+                    "the {} model is still downloading — auto mode starts once it's here",
+                    self.model
+                );
+                self.start_download_if_missing();
+                self.auto.on = false;
+                return;
+            }
+        }
+        // The capture stream feeds the worker directly, so audio keeps
+        // flowing even when this window isn't being drawn.
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let recorder = match Recorder::start_streaming(self.device.as_deref(), tx) {
+            Ok(recorder) => recorder,
+            Err(e) => {
+                self.status = format!("error: {e:#}");
+                self.auto.on = false;
+                return;
+            }
+        };
+        let rate = recorder.sample_rate();
+        let status = Arc::new(Mutex::new(auto::Status::default()));
+        let settings = auto::Settings {
+            cfg: auto::Config {
+                gap_secs: self.auto.gap_secs,
+                ..auto::Config::default()
+            },
+            model: self.model_path().unwrap_or_default(),
+            vad_model: Some(models_dir.join(VAD_MODEL_FILE)),
+            language: Options::default().language,
+            prompt: transcribe::build_prompt(&self.vocabulary, &self.context),
+            context: format!("{}\n{}", self.context, self.vocabulary),
+            summary_model: self.summary_model_path(),
+            vocabulary: self.vocabulary.clone(),
+            dir: self.transcripts_dir.clone(),
+        };
+        log::info!(
+            "auto mode on: {} Hz from {:?}, {} model, {:.0}s gap",
+            rate,
+            self.device,
+            self.model,
+            self.auto.gap_secs
+        );
+        let worker_status = status.clone();
+        let worker = std::thread::spawn(move || {
+            // A panic in here must not take the app down with it.
+            if let Err(e) = guarded(|| {
+                auto::run(&rx, rate, settings, &worker_status);
+                Ok(())
+            }) {
+                log::error!("auto worker died: {e:#}");
+                let mut status = worker_status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                status.error = Some(format!("{e:#}"));
+                status.phase = auto::Phase::Stopped;
+            }
+        });
+        self.auto.recorder = Some(recorder);
+        self.auto.worker = Some(worker);
+        self.auto.status = status;
+        self.auto.mirrored.clear();
+        self.auto.saved = 0;
+        self.auto.on = true;
+        self.status.clear();
+    }
+
+    /// Stop listening. Dropping the recorder stops the stream and closes
+    /// the channel with it; the worker then transcribes and files the
+    /// meeting it was in the middle of, which is what the "finishing"
+    /// status in the bar is about.
+    fn stop_auto(&mut self) {
+        self.auto.recorder = None;
+        self.auto.on = false;
+        self.status = "auto mode off".into();
+        log::info!("auto mode off");
+    }
+
+    /// Mirror what the worker reports into the UI. Returns the line to
+    /// show in the status bar while auto mode is running (or finishing).
+    fn poll_auto(&mut self) -> Option<String> {
+        // A device that dies mid-meeting would otherwise listen to
+        // silence forever.
+        if let Some(error) = self.auto.recorder.as_ref().and_then(|r| r.error()) {
+            self.stop_auto();
+            self.status = format!("error: recording failed: {error}");
+            return None;
+        }
+        // Reap a finished worker so the toggle can be used again.
+        if self.auto.worker.as_ref().is_some_and(|w| w.is_finished()) {
+            self.auto.worker = None;
+        }
+        if self.auto.worker.is_none() && !self.auto.on {
+            return None;
+        }
+
+        let status = self.auto.status.clone();
+        let status = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(error) = &status.error {
+            let error = error.clone();
+            drop(status);
+            self.stop_auto();
+            self.status = format!("error: auto mode stopped: {error}");
+            return None;
+        }
+        // Show the meeting as it is transcribed. Only new text replaces
+        // what's in the editor, so a transcript opened from the history
+        // stays until the next meeting actually says something.
+        if !status.transcript.is_empty() && status.transcript != self.auto.mirrored {
+            self.auto.mirrored.clone_from(&status.transcript);
+            self.transcript.clone_from(&status.transcript);
+            // Auto mode files its own transcripts; nothing to lose here.
+            self.transcript_saved = true;
+            self.speaker_voices.clear();
+            self.rename_inputs.clear();
+        }
+        if status.saved.len() != self.auto.saved {
+            self.auto.saved = status.saved.len();
+            self.history = transcripts::list(&self.transcripts_dir);
+        }
+        let note = if status.note.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", status.note)
+        };
+        Some(match status.phase {
+            auto::Phase::Listening if !self.auto.on => "finishing the last meeting ...".into(),
+            auto::Phase::Listening => format!(
+                "{EAR} listening for a meeting{}",
+                if status.saved.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {} filed", status.saved.len())
+                }
+            ),
+            auto::Phase::Recording => format!(
+                "{BROADCAST} meeting running {}{}",
+                format_mmss(status.meeting_secs),
+                note
+            ),
+            auto::Phase::Transcribing => format!("{BROADCAST} meeting{note}"),
+            auto::Phase::Saving => format!("naming and filing the meeting{note}"),
+            auto::Phase::Stopped => return None,
+        })
+    }
+
     /// Collect the resampling worker's progress; returns the status to show
     /// while it runs, and adopts the recording as the source when it's done.
     fn poll_finishing(&mut self) -> Option<(String, f32)> {
@@ -1103,10 +1314,12 @@ impl App {
         }
     }
 
-    /// Pick an audio file and make it the source.
+    /// Pick an audio or video file and make it the source.
     fn open_audio_file(&mut self) {
         if let Some(file) = rfd::FileDialog::new()
-            .add_filter("audio", &["mp3", "m4a", "mp4", "wav", "flac", "ogg"])
+            .add_filter("audio & video", MEDIA_EXTENSIONS)
+            .add_filter("audio", AUDIO_EXTENSIONS)
+            .add_filter("video", VIDEO_EXTENSIONS)
             .pick_file()
         {
             self.source = Some(Source::File(file));
@@ -1200,6 +1413,27 @@ impl eframe::App for App {
         GROUND.to_normalized_gamma_f32()
     }
 
+    /// Closing the window while auto mode is listening would otherwise
+    /// throw away the meeting in progress: stop capturing, then give the
+    /// worker time to transcribe and file what it already has.
+    fn on_exit(&mut self) {
+        if self.auto.on {
+            self.stop_auto();
+        }
+        let Some(worker) = self.auto.worker.take() else { return };
+        log::info!("waiting for the auto worker to file the last meeting");
+        // Bounded: a wedged worker must not keep the app from closing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while !worker.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if worker.is_finished() {
+            let _ = worker.join();
+        } else {
+            log::error!("the auto worker did not finish in time; exiting anyway");
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Painted here too (not only via clear_color) so off-screen renders
         // such as the snapshot test show the ground instead of transparency.
@@ -1209,6 +1443,7 @@ impl eframe::App for App {
         let downloading = self.poll_download();
         let enrolling = self.poll_enrollment();
         let summarizing = self.poll_summary();
+        let listening = self.poll_auto();
         // A dead input device would otherwise record silence forever.
         if let Some(error) = self.recorder.as_ref().and_then(|r| r.error()) {
             self.recorder = None;
@@ -1219,13 +1454,17 @@ impl eframe::App for App {
             || downloading.is_some()
             || enrolling
             || summarizing
+            || listening.is_some()
             || self.recorder.is_some()
             || self.enroll_recorder.is_some()
         {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         let recording = self.recorder.is_some();
-        let busy = running.is_some() || recording || finishing.is_some();
+        // Auto mode owns the input and the transcript view while it runs,
+        // so everything manual waits for it.
+        let busy =
+            running.is_some() || recording || finishing.is_some() || listening.is_some();
 
         // Each panel is a white card floating on the lavender ground.
         let top_frame =
@@ -1241,8 +1480,10 @@ impl eframe::App for App {
                 } else {
                     egui::Button::new(format!("{RECORD} Record"))
                 };
-                let can_record =
-                    running.is_none() && finishing.is_none() && self.enroll_recorder.is_none();
+                let can_record = running.is_none()
+                    && finishing.is_none()
+                    && self.enroll_recorder.is_none()
+                    && listening.is_none();
                 if ui.add_enabled(can_record, record_button).clicked() {
                     if self.discard_would_lose().is_some() {
                         self.confirm_discard = Some(Discard::Record);
@@ -1254,7 +1495,7 @@ impl eframe::App for App {
                 let selected = self.device.clone().unwrap_or_else(|| "default input".into());
                 egui::ComboBox::from_id_salt("device")
                     .selected_text(selected)
-                    .width(220.0)
+                    .width(180.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.device, None, "default input");
                         for name in &self.devices {
@@ -1264,8 +1505,51 @@ impl eframe::App for App {
                 if ui.button(ARROWS_CLOCKWISE).on_hover_text("refresh device list").clicked() {
                     self.devices = recorder::input_devices();
                 }
+                // Auto mode can't be flipped back on until the worker has
+                // finished filing the meeting it was in the middle of.
+                let auto_settling = !self.auto.on && self.auto.worker.is_some();
+                let can_auto = !recording && running.is_none() && finishing.is_none()
+                    && self.enroll_recorder.is_none()
+                    && !auto_settling;
+                let mut want_auto = self.auto.on;
+                let auto_toggle = ui
+                    .add_enabled_ui(can_auto, |ui| toggle(ui, &mut want_auto, "auto"))
+                    .inner
+                    .on_hover_text(
+                        "listen continuously, group what it hears into meetings, \
+                         and file each one transcribed and named",
+                    );
+                if auto_toggle.changed() {
+                    // Both set `auto.on` themselves — starting can fail
+                    // (no microphone, no model) and then it stays off.
+                    if want_auto {
+                        self.start_auto();
+                    } else {
+                        self.stop_auto();
+                    }
+                }
+                if self.auto.on {
+                    let selected = format!("ends after {}", format_gap(self.auto.gap_secs));
+                    egui::ComboBox::from_id_salt("auto-gap")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            for secs in [30.0, 60.0, 120.0, 300.0] {
+                                ui.selectable_value(
+                                    &mut self.auto.gap_secs,
+                                    secs,
+                                    format!("ends after {} of silence", format_gap(secs)),
+                                );
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "how long a silence ends a meeting — a pause shorter \
+                             than this keeps it running (takes effect next time \
+                             auto mode is switched on)",
+                        );
+                }
                 if ui
-                    .add_enabled(!busy, egui::Button::new(format!("{FOLDER_OPEN} Open audio…")))
+                    .add_enabled(!busy, egui::Button::new(format!("{FOLDER_OPEN} Open file…")))
                     .clicked()
                 {
                     if self.discard_would_lose().is_some() {
@@ -1275,6 +1559,26 @@ impl eframe::App for App {
                     }
                 }
                 match (&self.source, self.recorder.as_ref()) {
+                    // Auto mode owns the input: the live level plus whether
+                    // the gate hears anyone, so a dead or misrouted input
+                    // is obvious at a glance. What is "loaded" means
+                    // nothing here — the status bar says what it is doing.
+                    _ if self.auto.on => {
+                        if let Some(recorder) = &self.auto.recorder {
+                            let voiced = self
+                                .auto
+                                .status
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .voiced;
+                            ui.add(
+                                progress_bar((recorder.level() * 4.0).min(1.0))
+                                    .desired_width(80.0)
+                                    .fill(if voiced { RED } else { GREEN }),
+                            )
+                            .on_hover_text("input level — red while someone is talking");
+                        }
+                    }
                     (_, Some(recorder)) => {
                         ui.label(
                             egui::RichText::new(format!(
@@ -1378,6 +1682,16 @@ impl eframe::App for App {
                     .clicked()
                 {
                     self.show_speakers = !self.show_speakers;
+                }
+                if ui
+                    .button(format!("{CLOCK_COUNTER_CLOCKWISE} History…"))
+                    .on_hover_text("meetings auto mode has recorded and filed")
+                    .clicked()
+                {
+                    self.show_history = !self.show_history;
+                    if self.show_history {
+                        self.history = transcripts::list(&self.transcripts_dir);
+                    }
                 }
                 if !self.speaker_voices.is_empty()
                     && ui
@@ -1521,10 +1835,21 @@ impl eframe::App for App {
                             }
                         }
                         (None, None) => {
-                            if !self.status.is_empty() {
+                            if let Some(listening) = &listening {
+                                // Auto mode's own line: it is the app's
+                                // state while it runs, not a passing job.
+                                if self.auto.on {
+                                    ui.label(
+                                        egui::RichText::new(listening).color(ACCENT),
+                                    );
+                                } else {
+                                    ui.add(egui::Spinner::new().color(ACCENT));
+                                    ui.label(listening);
+                                }
+                            } else if !self.status.is_empty() {
                                 ui.label(&self.status);
                             } else {
-                                ui.weak("open an audio file or record one, then hit Transcribe");
+                                ui.weak("open an audio or video file or record one, then hit Transcribe");
                             }
                         }
                     }
@@ -1554,6 +1879,109 @@ impl eframe::App for App {
                     }
                 });
         });
+
+        let mut show_history = self.show_history;
+        egui::Window::new("History")
+            .open(&mut show_history)
+            .default_size([540.0, 470.0])
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Meetings auto mode has recorded, newest first.");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button(format!("{FOLDER_OPEN} Open folder"))
+                            .on_hover_text(self.transcripts_dir.display().to_string())
+                            .clicked()
+                        {
+                            let _ = std::fs::create_dir_all(&self.transcripts_dir);
+                            reveal(&self.transcripts_dir);
+                        }
+                        if ui.button(ARROWS_CLOCKWISE).on_hover_text("refresh").clicked() {
+                            self.history = transcripts::list(&self.transcripts_dir);
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                if self.history.is_empty() {
+                    ui.weak(
+                        "nothing here yet — switch auto mode on and it files \
+                         every meeting it hears",
+                    );
+                    return;
+                }
+                let mut open: Option<PathBuf> = None;
+                let mut delete: Option<PathBuf> = None;
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    for saved in &self.history {
+                        card()
+                            .inner_margin(egui::Margin::symmetric(12, 10))
+                            .fill(FIELD)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&saved.meta.title).strong(),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .button(TRASH)
+                                                .on_hover_text("delete this transcript")
+                                                .clicked()
+                                            {
+                                                delete = Some(saved.path.clone());
+                                            }
+                                            if ui.button("Open").clicked() {
+                                                open = Some(saved.path.clone());
+                                            }
+                                        },
+                                    );
+                                });
+                                let when = [saved.meta.date.as_str(), saved.meta.duration.as_str()]
+                                    .iter()
+                                    .filter(|s| !s.is_empty())
+                                    .copied()
+                                    .collect::<Vec<_>>()
+                                    .join(" · ");
+                                if !when.is_empty() {
+                                    ui.weak(when);
+                                }
+                                if !saved.meta.summary.is_empty() {
+                                    ui.label(&saved.meta.summary);
+                                }
+                            });
+                        ui.add_space(6.0);
+                    }
+                });
+                if let Some(path) = open {
+                    match transcripts::read(&path) {
+                        Ok((meta, body)) => {
+                            self.transcript = body;
+                            self.transcript_saved = true;
+                            self.source = None;
+                            self.speaker_voices.clear();
+                            self.rename_inputs.clear();
+                            self.summary.clone_from(&meta.summary);
+                            // Don't let the live meeting overwrite what was
+                            // just opened.
+                            self.auto.mirrored.clear();
+                            self.status = format!("opened \"{}\"", meta.title);
+                        }
+                        Err(e) => self.status = format!("error: {e:#}"),
+                    }
+                }
+                if let Some(path) = delete {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {
+                            self.status = format!("deleted {}", path.display());
+                            self.history = transcripts::list(&self.transcripts_dir);
+                        }
+                        Err(e) => self.status = format!("error: failed to delete: {e}"),
+                    }
+                }
+            });
+        self.show_history = show_history;
 
         let mut show_vocabulary = self.show_vocabulary;
         self.show_discard_dialog(ui.ctx());
@@ -1719,12 +2147,14 @@ impl eframe::App for App {
                         ui.label("enrolling from file ...");
                     } else {
                         let button =
-                            egui::Button::new(format!("{FOLDER_OPEN} From audio file…"));
+                            egui::Button::new(format!("{FOLDER_OPEN} From file…"));
                         let can_file =
                             can_enroll && self.enroll_recorder.is_none();
                         if ui.add_enabled(can_file, button).clicked()
                             && let Some(file) = rfd::FileDialog::new()
-                                .add_filter("audio", &["mp3", "m4a", "mp4", "wav", "flac", "ogg"])
+                                .add_filter("audio & video", MEDIA_EXTENSIONS)
+                                .add_filter("audio", AUDIO_EXTENSIONS)
+                                .add_filter("video", VIDEO_EXTENSIONS)
                                 .pick_file()
                         {
                             self.start_file_enrollment(file);
@@ -1810,6 +2240,28 @@ impl eframe::App for App {
                 }
             });
         self.show_rename = show_rename;
+    }
+}
+
+/// "30 s" / "1 min" / "5 min", for the silence-gap picker.
+fn format_gap(secs: f64) -> String {
+    if secs < 60.0 {
+        format!("{secs:.0} s")
+    } else {
+        format!("{} min", (secs / 60.0).round() as i64)
+    }
+}
+
+/// Show a directory in the system file manager.
+fn reveal(path: &Path) {
+    #[cfg(target_os = "macos")]
+    let command = "open";
+    #[cfg(target_os = "windows")]
+    let command = "explorer";
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let command = "xdg-open";
+    if let Err(e) = std::process::Command::new(command).arg(path).spawn() {
+        log::error!("failed to open {}: {e}", path.display());
     }
 }
 
@@ -2034,6 +2486,96 @@ mod tests {
         let mut canvas = imageops::blur(&shadow, SHADOW_BLUR);
         imageops::overlay(&mut canvas, &window, MARGIN as i64, MARGIN as i64);
         canvas
+    }
+
+    /// Auto mode mid-meeting: the toggle on, the silence-gap picker
+    /// beside it, the transcript arriving as it is decoded, and the
+    /// listening line in the status bar.
+    #[test]
+    #[ignore = "needs a GPU; run with --ignored to check/update the UI snapshot"]
+    fn ui_screenshot_auto() {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(860.0, 640.0))
+            .with_theme(egui::Theme::Light)
+            .build_eframe(|cc| {
+                super::setup_theme(&cc.egui_ctx);
+                let mut app = super::App::new();
+                app.models_dir = Some(fixture_models_dir());
+                app.auto.on = true;
+                *app.auto.status.lock().unwrap() = transcribe::auto::Status {
+                    phase: transcribe::auto::Phase::Recording,
+                    meeting_secs: 942.0,
+                    voiced: true,
+                    note: "transcribing the last 45s (60%)".into(),
+                    saved: vec!["2026-09-17 0930 Vendor contract review.txt".into()],
+                    ..transcribe::auto::Status::default()
+                };
+                app.transcript = "\
+                    Morning everyone, thanks for joining the quarterly planning call.\n\
+                    Today we need to settle the budget for the new data centre.\n\
+                    Sarah has prepared the cost breakdown, so let's agree a number.\n"
+                    .into();
+                app
+            });
+        // Auto mode asks for a repaint every frame, so this can't be run
+        // to quiescence the way the static views are — the fonts need two
+        // frames, and a third settles the layout.
+        harness.run_steps(3);
+        harness.snapshot("transcribe-gui-auto");
+    }
+
+    /// The history window: what auto mode has filed, each meeting under
+    /// the name and one-line summary the model gave it.
+    #[test]
+    #[ignore = "needs a GPU; run with --ignored to check/update the UI snapshot"]
+    fn ui_screenshot_history() {
+        fn saved(title: &str, date: &str, duration: &str, summary: &str) -> super::transcripts::Saved {
+            super::transcripts::Saved {
+                path: format!("{date} {title}.txt").into(),
+                meta: super::transcripts::Meta {
+                    title: title.into(),
+                    date: date.into(),
+                    duration: duration.into(),
+                    summary: summary.into(),
+                },
+                bytes: 4096,
+                modified: std::time::SystemTime::UNIX_EPOCH,
+            }
+        }
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(860.0, 640.0))
+            .with_theme(egui::Theme::Light)
+            .build_eframe(|cc| {
+                super::setup_theme(&cc.egui_ctx);
+                let mut app = super::App::new();
+                app.models_dir = Some(fixture_models_dir());
+                app.show_history = true;
+                app.history = vec![
+                    saved(
+                        "Data centre budget and migration ownership",
+                        "2026-09-17 14:32",
+                        "48:12",
+                        "The team settled on 400,000 euros and gave Sarah the migration, \
+                         with vendor contracts due at the end of the month.",
+                    ),
+                    saved(
+                        "Onboarding doc review",
+                        "2026-09-16 09:05",
+                        "21:40",
+                        "Chris walked through the onboarding guide; the GPU build section \
+                         needs rewriting before it goes out.",
+                    ),
+                    saved(
+                        "Vendor contract review",
+                        "2026-09-15 16:20",
+                        "12:03",
+                        "Two of the three quotes came back under budget.",
+                    ),
+                ];
+                app
+            });
+        harness.run();
+        harness.snapshot("transcribe-gui-history");
     }
 
     /// The model picker opened, so its rows and bars are checked too.

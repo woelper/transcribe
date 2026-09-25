@@ -1,5 +1,7 @@
 /target
 /models
+# meetings auto mode files while the app runs from a checkout
+/transcripts
 *.mp3
 *.mp4
 *.m4a
