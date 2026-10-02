@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Transcribe's whole purpose. The hardened runtime that notarisation
+	     requires denies the microphone to an app that has not asked for it,
+	     and denies it silently: the app opens, records nothing, and says
+	     nothing about why. NSMicrophoneUsageDescription in Info.plist is the
+	     prompt shown to the user; this is the permission behind it, and both
+	     are needed. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

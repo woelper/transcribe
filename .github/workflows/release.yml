@@ -40,12 +40,34 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
-      - name: Package (macOS)
+      - name: Bundle (macOS)
         if: runner.os == 'macOS'
         run: |
           cargo install cargo-bundle --locked
           ./bundle.sh
-          # ditto preserves the code signature and extended attributes
+
+      # After bundle.sh, never before: it edits Info.plist with PlistBuddy and
+      # signs ad-hoc, and both invalidate a real signature. The entitlements
+      # are what keep the microphone working under the hardened runtime that
+      # notarisation insists on.
+      - name: Sign and notarise (macOS)
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/macos-sign
+        with:
+          app-path: target/release/bundle/osx/Transcribe.app
+          entitlements: .github/transcribe.entitlements
+          certificate-p12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          certificate-password: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          team-id: ${{ secrets.MACOS_TEAM_ID }}
+          api-key-p8: ${{ secrets.MACOS_API_KEY_P8 }}
+          api-key-id: ${{ secrets.MACOS_API_KEY_ID }}
+          api-issuer-id: ${{ secrets.MACOS_API_ISSUER_ID }}
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # ditto preserves the code signature, the extended attributes and
+          # the stapled notarisation ticket; zip drops the last of those.
           ditto -c -k --keepParent target/release/bundle/osx/Transcribe.app \
             Transcribe-${{ matrix.target }}.zip
 
