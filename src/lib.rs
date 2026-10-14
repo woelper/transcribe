@@ -567,7 +567,7 @@ fn run_transcribe_cpp<F>(
 where
     F: Fn(Progress) + Send + Sync + 'static,
 {
-    use transcribe_cpp::{Model, RunOptions, SessionOptions, TimestampKind};
+    use transcribe_cpp::Model;
 
     if opts.translate {
         bail!("translation needs a Whisper model; this one only transcribes");
@@ -578,10 +578,48 @@ where
     static QUIET: std::sync::Once = std::sync::Once::new();
     QUIET.call_once(transcribe_cpp::disable_logging);
 
-    let audio_secs = samples.len() as f64 / WHISPER_SAMPLE_RATE as f64;
-    let threads = thread_count(opts);
+    if KEEP_MODELS.load(std::sync::atomic::Ordering::Relaxed) {
+        return CACHED_MODEL.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.as_ref().is_none_or(|(path, _)| path != &opts.model) {
+                let model = Model::load(&opts.model)
+                    .with_context(|| format!("failed to load model {}", opts.model.display()))?;
+                *cache = Some((opts.model.clone(), model));
+            }
+            let (_, model) = cache.as_ref().expect("just loaded");
+            run_transcribe_cpp_with(model, samples, opts, progress)
+        });
+    }
     let model = Model::load(&opts.model)
         .with_context(|| format!("failed to load model {}", opts.model.display()))?;
+    run_transcribe_cpp_with(&model, samples, opts, progress)
+}
+
+/// Keep loaded GGUF models (Parakeet, …) in memory between calls on the same thread, instead
+/// of loading them for every file — for long-running callers (`transcribe --serve`).
+pub fn keep_models(keep: bool) {
+    KEEP_MODELS.store(keep, std::sync::atomic::Ordering::Relaxed);
+}
+
+static KEEP_MODELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    static CACHED_MODEL: std::cell::RefCell<Option<(PathBuf, transcribe_cpp::Model)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn run_transcribe_cpp_with<F>(
+    model: &transcribe_cpp::Model,
+    samples: &[f32],
+    opts: &Options,
+    progress: &Arc<F>,
+) -> Result<(Vec<RawSegment>, usize)>
+where
+    F: Fn(Progress) + Send + Sync + 'static,
+{
+    use transcribe_cpp::{RunOptions, SessionOptions, TimestampKind};
+    let audio_secs = samples.len() as f64 / WHISPER_SAMPLE_RATE as f64;
+    let threads = thread_count(opts);
     let word_timed = matches!(
         model.capabilities().max_timestamp_kind,
         TimestampKind::Word | TimestampKind::Token

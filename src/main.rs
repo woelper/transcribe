@@ -12,7 +12,13 @@ struct Args {
     /// Input audio or video file (mp3, m4a, wav, flac, ogg, mp4, mkv, webm,
     /// ...). Codecs the built-in decoder lacks, such as Opus and AC-3, are
     /// handed to ffmpeg if it is installed
-    audio: PathBuf,
+    #[arg(required_unless_present = "serve")]
+    audio: Option<PathBuf>,
+    /// Keep the model loaded and transcribe one file per line read from stdin; prints one
+    /// JSON line per file ({"text": …} or {"error": …}). For callers that transcribe often
+    /// (e.g. a phone assistant): the model is loaded once instead of for every file.
+    #[arg(long)]
+    serve: bool,
 
     /// Path to a speech model: a ggml Whisper .bin, or the Parakeet .gguf
     /// (see download-model.sh)
@@ -162,8 +168,12 @@ fn main() -> Result<()> {
         }),
     };
 
-    eprintln!("decoding {} ...", args.audio.display());
-    let transcript = transcribe::transcribe(&args.audio, &opts, |progress| match progress {
+    if args.serve {
+        return serve(&opts);
+    }
+    let audio = args.audio.expect("required unless --serve");
+    eprintln!("decoding {} ...", audio.display());
+    let transcript = transcribe::transcribe(&audio, &opts, |progress| match progress {
         Progress::Decoded { audio_secs, took_secs } => {
             eprintln!("decoded {audio_secs:.1}s of audio in {took_secs:.1}s");
         }
@@ -213,5 +223,27 @@ fn main() -> Result<()> {
         None => print!("{}", transcript.text),
     }
 
+    Ok(())
+}
+
+/// `--serve`: one file path per stdin line → one JSON line on stdout. The model stays loaded.
+fn serve(opts: &Options) -> Result<()> {
+    use std::io::{BufRead, Write};
+    transcribe::keep_models(true);
+    let mut out = std::io::stdout().lock();
+    eprintln!("serving: one audio file path per line");
+    for line in std::io::stdin().lock().lines() {
+        let path = line?;
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let reply = match transcribe::transcribe(std::path::Path::new(path), opts, |_| {}) {
+            Ok(t) => serde_json::json!({ "text": t.text.split_whitespace().collect::<Vec<_>>().join(" ") }),
+            Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+        };
+        writeln!(out, "{reply}")?;
+        out.flush()?;
+    }
     Ok(())
 }
