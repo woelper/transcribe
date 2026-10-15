@@ -621,7 +621,7 @@ where
     let audio_secs = samples.len() as f64 / WHISPER_SAMPLE_RATE as f64;
     let threads = thread_count(opts);
     let word_timed = matches!(
-        model.capabilities().max_timestamp_kind,
+        model.capabilities()?.max_timestamp_kind,
         TimestampKind::Word | TimestampKind::Token
     );
     let mut session =
@@ -654,15 +654,15 @@ where
         if chunk.len() < WHISPER_SAMPLE_RATE {
             chunk.resize(WHISPER_SAMPLE_RATE, 0.0);
         }
-        // One stretch can run the decoder out of context — usually because
-        // the model fell into a repetition loop on music or noise. The
-        // library hands back what it decoded before giving up, so that
-        // stretch is all that is lost: hours of already-decoded audio must
-        // not go with it.
+        // One stretch can run the decoder out of context, or send it round
+        // a repetition loop on music or noise. Either way the library hands
+        // back what it decoded before giving up, so that stretch is all
+        // that is lost: hours of already-decoded audio must not go with it.
         let result = match session.run(&chunk, &run) {
             Ok(result) => result,
             Err(
                 transcribe_cpp::Error::OutputTruncated { partial, message }
+                | transcribe_cpp::Error::OutputRepetition { partial, message }
                 | transcribe_cpp::Error::Aborted { partial, message },
             ) => {
                 incomplete += 1;
