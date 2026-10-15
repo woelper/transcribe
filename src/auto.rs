@@ -510,6 +510,12 @@ fn lock<T>(shared: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// and return. Owns all the slow work — resampling, transcription,
 /// titling — so the UI thread only has to hand over audio.
 pub fn run(rx: &Receiver<Vec<f32>>, rate: u32, mut settings: Settings, status: &Arc<Mutex<Status>>) {
+    // A meeting is decoded a chunk at a time, so without this the model is
+    // loaded again every 45-150s for as long as the app listens. The cache
+    // is per thread and this is the only thread that uses it, so the model
+    // is freed when listening stops. Costs the model's memory meanwhile,
+    // and applies to the GGUF engine only — whisper.cpp loads its own.
+    crate::keep_models(true);
     // The VAD model is tiny and keeps whisper from inventing sentences for
     // the quiet parts; fetch it on first use. Offline, carry on without it
     // — the level gate has already cut most of the silence away.
