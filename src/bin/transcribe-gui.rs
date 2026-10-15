@@ -1788,8 +1788,12 @@ impl eframe::App for App {
                             .map_or("transcript".into(), |s| s.to_string_lossy().into_owned()),
                         _ => "transcript".into(),
                     };
+                    // Same shape the automatic saves use, so a folder holding
+                    // both sorts by when it was said. The colon is dropped
+                    // because Windows forbids it in a file name.
+                    let stamp = chrono::Local::now().format("%Y-%m-%d %H%M");
                     if let Some(path) = rfd::FileDialog::new()
-                        .set_file_name(format!("{name}.txt"))
+                        .set_file_name(format!("{stamp} {name}.txt"))
                         .add_filter("text", &["txt"])
                         .save_file()
                     {

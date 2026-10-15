@@ -215,6 +215,14 @@ the binaries in `~/.local/bin` and installs a launcher and icon for the
 current user, so Transcribe appears in the app menu and shows its icon in
 the dock — on Wayland the icon can only come from such a desktop entry.
 
+For a system-wide install on Debian, Ubuntu and their relatives,
+`./build-deb.sh --install` builds a `.deb` (in `target/debian/`) and
+installs it: both binaries in `/usr/bin`, plus the launcher and icon. The
+installed app is independent of the checkout's `target/` directory and of
+the Rust toolchain, so `cargo clean` doesn't take it away. Without
+`--install` the script only builds the package; `sudo apt remove
+transcribe` uninstalls it.
+
 To get a double-clickable **Transcribe.app**, install [cargo-bundle](https://github.com/burtonageo/cargo-bundle)
 and run `./bundle.sh` (not `cargo bundle` directly — the script picks the GUI
 binary and adds the microphone usage description macOS requires). The app
