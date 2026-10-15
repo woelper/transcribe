@@ -43,9 +43,10 @@ macro_rules! standard_model {
 /// multilingual accuracy/speed tradeoff, distil-large-v3.5 is faster and
 /// slightly more accurate but English-only, and the small ones trade
 /// accuracy for speed and disk space. The `.gguf` entries run on
-/// transcribe.cpp and take no vocabulary/context prompt: NVIDIA's Parakeet
-/// is more accurate than any Whisper on English and an order of magnitude
-/// faster, for 25 European languages; Alibaba's Qwen3-ASR covers 52
+/// transcribe.cpp and take no vocabulary/context prompt: parakeet-ultra
+/// (Moondream's tuning of NVIDIA's Parakeet v3) is more accurate than any
+/// Whisper on English and an order of magnitude faster, for 25 European
+/// languages; Alibaba's Qwen3-ASR covers 52
 /// languages and is by far the most robust to background noise.
 pub const SPEECH_MODELS: &[SpeechModel] = &[
     standard_model!("tiny", 75, 0.2, 1.0),
@@ -64,13 +65,13 @@ pub const SPEECH_MODELS: &[SpeechModel] = &[
         url: "https://huggingface.co/distil-whisper/distil-large-v3.5-ggml/resolve/main/ggml-model.bin",
     },
     SpeechModel {
-        name: "parakeet-tdt-0.6b-v3",
-        mb: 705,
-        accuracy: 0.9,
+        name: "parakeet-ultra",
+        mb: 706,
+        accuracy: 0.95,
         speed: 1.0,
         note: "25 EU langs, no prompt",
-        file: "parakeet-tdt-0.6b-v3-Q8_0.gguf",
-        url: "https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf/resolve/main/parakeet-tdt-0.6b-v3-Q8_0.gguf",
+        file: "parakeet-ultra-Q8_0.gguf",
+        url: "https://huggingface.co/handy-computer/parakeet-ultra-gguf/resolve/main/parakeet-ultra-Q8_0.gguf",
     },    SpeechModel {
         name: "qwen3-asr-1.7b",
         mb: 2084,

@@ -2411,7 +2411,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         for file in [
             "ggml-large-v3-turbo.bin",
-            "parakeet-tdt-0.6b-v3-Q8_0.gguf",
+            "parakeet-ultra-Q8_0.gguf",
             "Qwen3-ASR-0.6B-Q8_0.gguf",
             "segmentation-3.0.onnx",
             "wespeaker_en_voxceleb_CAM++.onnx",
@@ -2680,8 +2680,11 @@ mod tests {
             super::remembered_model(&Settings { model: model.map(str::to_owned) })
         };
         assert_eq!(remembered(None), super::DEFAULT_MODEL, "first run");
-        assert_eq!(remembered(Some("parakeet-tdt-0.6b-v3")), "parakeet-tdt-0.6b-v3");
+        assert_eq!(remembered(Some("parakeet-ultra")), "parakeet-ultra");
         assert_eq!(remembered(Some("tiny")), "tiny");
+        // Dropped when parakeet-ultra replaced it: anyone who had it
+        // selected lands on the default rather than on a dead name.
+        assert_eq!(remembered(Some("parakeet-tdt-0.6b-v3")), super::DEFAULT_MODEL);
         assert_eq!(remembered(Some("ggml-whisper-from-2023")), super::DEFAULT_MODEL);
         assert_eq!(remembered(Some("")), super::DEFAULT_MODEL);
     }
