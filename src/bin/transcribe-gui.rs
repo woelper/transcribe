@@ -905,6 +905,9 @@ impl App {
         let mut job = job.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match job.result.take() {
             Some(Ok(summary)) => {
+                if log_text() {
+                    log::info!("summary with {} follows:\n{summary}", self.summary_model);
+                }
                 self.summary = summary;
                 self.status = "summary ready".into();
                 self.summary_job = None;
@@ -1281,6 +1284,9 @@ impl App {
                     transcript.text.len(),
                     transcript.speakers
                 );
+                if log_text() {
+                    log::info!("transcript follows:\n{}", transcript.text);
+                }
                 self.source_transcribed = true;
                 self.transcript_saved = false;
                 self.transcript = transcript.text;
@@ -2366,6 +2372,17 @@ fn remembered_model(settings: &settings::Settings) -> String {
     }
 }
 
+/// Whether to write transcripts and summaries into the log verbatim.
+/// Off by default — the log is the file a user sends when something goes
+/// wrong, and what was said in a meeting does not belong in it unless
+/// they ask. `TRANSCRIBE_LOG_TEXT=1` asks.
+fn log_text() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(std::env::var("TRANSCRIBE_LOG_TEXT").as_deref(), Ok("1") | Ok("true"))
+    })
+}
+
 /// Same as [`remembered_model`], for the summary model.
 fn remembered_summary_model(settings: &settings::Settings) -> String {
     match settings.summary_model.as_deref() {
@@ -2524,8 +2541,11 @@ mod tests {
                 super::setup_theme(&cc.egui_ctx);
                 let mut app = super::App::new();
                 app.models_dir = Some(fixture_models_dir());
-                // Not whatever model this machine last picked.
+                // Not whatever models this machine last picked: both come
+                // from settings.json, so a real one would leak into the
+                // snapshot and fail the test on the developer's machine.
                 app.model = super::DEFAULT_MODEL.to_owned();
+                app.summary_model = super::DEFAULT_SUMMARY_MODEL.to_owned();
                 app.source = Some(super::Source::File("standup-2026-09-05.m4a".into()));
                 app.diarize = true;
                 app.context = "Weekly standup — Anna, Ben, Chris. Topics: \
@@ -2638,8 +2658,11 @@ mod tests {
                 super::setup_theme(&cc.egui_ctx);
                 let mut app = super::App::new();
                 app.models_dir = Some(fixture_models_dir());
-                // Not whatever model this machine last picked.
+                // Not whatever models this machine last picked: both come
+                // from settings.json, so a real one would leak into the
+                // snapshot and fail the test on the developer's machine.
                 app.model = super::DEFAULT_MODEL.to_owned();
+                app.summary_model = super::DEFAULT_SUMMARY_MODEL.to_owned();
                 app.auto.on = true;
                 *app.auto.status.lock().unwrap() = transcribe::auto::Status {
                     phase: transcribe::auto::Phase::Recording,
@@ -2688,8 +2711,11 @@ mod tests {
                 super::setup_theme(&cc.egui_ctx);
                 let mut app = super::App::new();
                 app.models_dir = Some(fixture_models_dir());
-                // Not whatever model this machine last picked.
+                // Not whatever models this machine last picked: both come
+                // from settings.json, so a real one would leak into the
+                // snapshot and fail the test on the developer's machine.
                 app.model = super::DEFAULT_MODEL.to_owned();
+                app.summary_model = super::DEFAULT_SUMMARY_MODEL.to_owned();
                 app.show_history = true;
                 app.history = vec![
                     saved(
@@ -2730,8 +2756,11 @@ mod tests {
                 super::setup_theme(&cc.egui_ctx);
                 let mut app = super::App::new();
                 app.models_dir = Some(fixture_models_dir());
-                // Not whatever model this machine last picked.
+                // Not whatever models this machine last picked: both come
+                // from settings.json, so a real one would leak into the
+                // snapshot and fail the test on the developer's machine.
                 app.model = super::DEFAULT_MODEL.to_owned();
+                app.summary_model = super::DEFAULT_SUMMARY_MODEL.to_owned();
                 app.source = Some(super::Source::File("standup-2026-09-05.m4a".into()));
                 app
             });

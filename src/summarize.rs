@@ -26,36 +26,73 @@ const MAX_OUTPUT_TOKENS: usize = 2048;
 /// Prompt tokens are fed to the model in chunks of this size.
 const N_BATCH: usize = 2048;
 
+/// Not "minutes of a meeting": told that, the model refuses outright on
+/// a transcript that is not one. A solo dictation about buying a car
+/// came back as "No meeting minutes can be generated from this
+/// transcript", which is useless — the app transcribes dictation as
+/// readily as meetings, so the prompt has to cover both and say so.
+///
 /// Naming the sections and spelling out what belongs in each is worth
 /// more than it looks: asked only to "structure the answer", these
 /// models merge decisions into action items, drop tasks that were agreed
 /// in passing, and quietly round "nineteen a seat" up to "$19" — a
-/// currency the speakers never said. The transcript is speech, so the
-/// rules about mishearings and speaker labels earn their place too.
-const SYSTEM_PROMPT: &str = "You write the minutes of a recorded meeting or talk \
-    from its transcript.\n\
+/// currency the speakers never said.
+///
+/// The two rules about mishearings pull against each other and both are
+/// needed. Told only not to invent, the model copies "Cooper Netis" and
+/// "engine X" straight through, and will even write "Kubernetes" in the
+/// overview and "Cooper Netis" three times below it. Told only to
+/// correct, it starts tidying figures and dates it merely finds
+/// implausible. So: facts are fixed, words are not, and the examples
+/// show which is which.
+///
+/// This reliably fixes product and technical terms on every size. It
+/// does *not* reliably fix people's names — "Layna" for an enrolled
+/// Lena survives on both the 4B and the 35B, in different amounts from
+/// run to run, even with the name in the vocabulary. Spelling that out
+/// in the prompt was tried and moved the two models in opposite
+/// directions, so it was dropped. If it matters, do it in code against
+/// [`crate::vocabulary_terms`] rather than by asking.
+const SYSTEM_PROMPT: &str = "You write up what was said in a recording, from \
+    its transcript. It may be a meeting with several speakers, a talk, an \
+    interview, or one person dictating free notes or thinking aloud. Write \
+    something \
+    useful for whichever it is. Never reply that the transcript is unsuitable \
+    and never explain why you cannot summarize it — there is always something \
+    to write down.\n\
     \n\
     Rules:\n\
     - Answer in the language the transcript is written in.\n\
-    - Use only what the transcript says. Never add a currency symbol, a date, a \
-    name or a number that is not there. If the transcript says \"nineteen a \
-    seat\", write \"19 a seat\", not \"$19 a seat\".\n\
-    - The transcript comes from speech recognition: speakers are labelled by \
-    name or as \"Speaker N\", words may be misheard, and people interrupt each \
-    other. Attribute each point to the speaker who made it, using the label the \
-    transcript uses.\n\
+    - Numbers, currencies and dates are copied, never interpreted. Write every \
+    figure exactly as spoken. The speakers said \"nineteen a seat\", so write \
+    \"19 a seat\" — writing \"$19 a seat\" invents a currency nobody used, and \
+    is wrong even when the amount is right. If no currency was spoken, use no \
+    currency symbol at all. Never add a figure or a deadline the transcript \
+    does not contain.\n\
+    - Correct misheard words — this applies to words only, never to the \
+    figures above. The transcript comes from speech recognition, so \
+    a name, product or technical term is often written as whatever it sounded \
+    like: \"post grass\" for PostgreSQL, \"engine X\" for nginx, \"Cooper Netis\" \
+    for Kubernetes, \"sam all\" for SAML. Work out what was meant and write \
+    that — that is transcribing what was said, not inventing it. When a \
+    mangled word matches one of the names and terms given below, use that \
+    spelling, and use one spelling throughout.\n\
+    - Speakers are labelled by name or as \"Speaker N\". Attribute each point to \
+    the speaker who made it; one person talking alone needs no attribution.\n\
     - Prefer the concrete over the general: name the thing, the number and the \
     owner.\n\
     \n\
-    Produce exactly these sections, in this order. Omit a section only if the \
-    transcript has nothing for it.\n\
+    Use these sections, in this order, and leave out any the transcript has \
+    nothing for. One person describing a car gets an Overview and Key points \
+    and nothing else; that is a complete answer, not a failure.\n\
     \n\
     ## Overview\n\
     Two to four sentences: what this was and what came out of it.\n\
     \n\
-    ## Discussion\n\
-    One bullet per topic, in the order discussed. Name the topic, the positions \
-    taken, and how it was left.\n\
+    ## Key points\n\
+    One bullet per topic, in the order it came up. Name the thing, the figure \
+    and the reasoning. Where people disagreed, give the positions taken and how \
+    it was left.\n\
     \n\
     ## Decisions\n\
     One bullet per decision actually settled. Include the number or deadline \
@@ -146,7 +183,7 @@ pub fn summarize(
         user.push_str(&format!("Summarize this transcript:\n\n{transcript}"));
         user
     };
-    generate(
+    let summary = generate(
         model_path,
         SYSTEM_PROMPT,
         &build_user,
@@ -154,7 +191,8 @@ pub fn summarize(
         N_CTX,
         MAX_OUTPUT_TOKENS,
         on_progress,
-    )
+    )?;
+    Ok(strip_unspoken_currency(&summary, transcript))
 }
 
 /// A finished meeting's name and one-line gist, from the same model that
@@ -165,8 +203,10 @@ pub struct Label {
     pub summary: String,
 }
 
-const LABEL_SYSTEM_PROMPT: &str = "You label meeting transcripts. Reply with \
-    exactly two lines and nothing else:\n\
+const LABEL_SYSTEM_PROMPT: &str = "You label meeting transcripts. The \
+    transcript comes from speech recognition, so correct any misheard name or \
+    term to what was plainly meant, preferring the spellings listed with the \
+    transcript. Reply with exactly two lines and nothing else:\n\
     Title: a specific name for this meeting, at most six words, no quotes\n\
     Summary: one sentence, at most 25 words, saying what it was about\n\
     Name the actual subject rather than the format — \"Q3 budget and \
@@ -243,6 +283,44 @@ fn parse_label(text: &str) -> Label {
     // A title is a name, not a sentence.
     label.title = label.title.trim_end_matches('.').trim().to_owned();
     label
+}
+
+/// Strip a currency symbol the speakers never used.
+///
+/// Asking the model not to invent one does not work: told to write
+/// figures exactly as spoken it still turns "nineteen a seat" into
+/// "$19 a seat", and three different wordings of the rule (including
+/// putting it first, ahead of the licence to correct misheard words)
+/// each left five or six of them in a 40-minute meeting. It is a
+/// mechanical problem, so it gets a mechanical fix: a symbol that
+/// appears nowhere in the transcript, by sign or by name, is dropped
+/// from the summary when it sits directly in front of a digit. The
+/// amount is the model's to report; the currency is the speakers'.
+fn strip_unspoken_currency(summary: &str, transcript: &str) -> String {
+    const CURRENCIES: &[(char, &[&str])] = &[
+        ('$', &["$", "dollar", "usd", "buck"]),
+        ('€', &["€", "euro", "eur"]),
+        ('£', &["£", "pound", "gbp", "sterling"]),
+    ];
+    let spoken = transcript.to_ascii_lowercase();
+    let unspoken: Vec<char> = CURRENCIES
+        .iter()
+        .filter(|(_, names)| !names.iter().any(|n| spoken.contains(n)))
+        .map(|(sign, _)| *sign)
+        .collect();
+    if unspoken.is_empty() {
+        return summary.to_owned();
+    }
+    let mut out = String::with_capacity(summary.len());
+    let mut chars = summary.chars().peekable();
+    while let Some(c) = chars.next() {
+        // Only "$19" goes; a bare symbol, or "US$" style prose, stays.
+        if unspoken.contains(&c) && chars.peek().is_some_and(char::is_ascii_digit) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Run one chat-model generation: load the model, fit the prompt into the
@@ -367,7 +445,32 @@ fn without_thinking(text: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::without_thinking;
+    use super::{strip_unspoken_currency, without_thinking};
+
+    #[test]
+    fn invented_currency_is_dropped_but_spoken_currency_is_kept() {
+        // Nobody said dollars, so the model's "$" goes and the figure stays.
+        assert_eq!(
+            strip_unspoken_currency("A seat is $19 and the tier is $49.", "nineteen a seat"),
+            "A seat is 19 and the tier is 49."
+        );
+        // Said out loud, by name or by sign: left alone.
+        assert_eq!(
+            strip_unspoken_currency("It is $19.", "nineteen dollars a seat"),
+            "It is $19."
+        );
+        assert_eq!(strip_unspoken_currency("It is €3500.", "3500 euros"), "It is €3500.");
+        assert_eq!(strip_unspoken_currency("It is £20.", "twenty pounds"), "It is £20.");
+        // One currency spoken does not license another.
+        assert_eq!(
+            strip_unspoken_currency("€3500, about $4000.", "3500 euros"),
+            "€3500, about 4000."
+        );
+        // Not in front of a digit: prose and code are untouched.
+        assert_eq!(strip_unspoken_currency("the $ sign and a$b", "nothing"), "the $ sign and a$b");
+        // Nothing to do is the common case and must not rewrite anything.
+        assert_eq!(strip_unspoken_currency("plain text", "plain"), "plain text");
+    }
 
     #[test]
     fn strips_reasoning_blocks() {
