@@ -55,15 +55,15 @@ app ever closes on its own, that file says why.
   voice in one step (see below).
 - **Summarize** writes the minutes — overview, discussion, decisions, open
   questions, action items — with a local language model, using the context
-  notes and vocabulary too (downloaded on first use). The picker in the
-  Summary window offers four sizes of Qwen3.5, so the app stays usable on
-  an old laptop and gets good on a big machine: **2b** (1.2 GB, the floor —
-  gets the shape right, misattributes some action items), **4b** (2.6 GB,
-  the default), **9b** (5.4 GB), and **35b-a3b** (15.8 GB, the best by a
-  wide margin). The last is a mixture of experts — 35B parameters but only
-  ~3B of them run per token — so on a CPU it generates *faster* than the
-  dense 9b while keeping the numbers and tradeoffs a decision turned on.
-  Give it ~18 GB of RAM.
+  notes and vocabulary too (downloaded on first use). The **summary** picker
+  in the toolbar offers four sizes of Qwen3.5, so the app stays usable on an
+  old laptop and gets good on a big machine: **2b** (1.2 GB, the floor — it
+  gets the shape of a meeting right but misattributes some action items),
+  **4b** (2.6 GB, the default), **9b** (5.4 GB), and **35b-a3b** (15.8 GB,
+  the best by a wide margin). The last is a mixture of experts — 35B
+  parameters but only ~3B of them run per token — so on a CPU it generates
+  *faster* than the dense 9b while keeping the numbers and tradeoffs a
+  decision turned on. Give it ~18 GB of RAM.
 - The transcript is editable in place; **Save transcript…** writes it via a
   file dialog.
 

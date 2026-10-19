@@ -696,6 +696,50 @@ impl App {
         }
     }
 
+    /// The summary-model dropdown. It belongs beside the speech-model one
+    /// rather than in the Summary window: that window only opens once a
+    /// summary is already running, so a picker inside it could not be
+    /// reached until after the first summary had downloaded and run with
+    /// whatever the default was.
+    fn summary_model_picker(&mut self, ui: &mut egui::Ui, enabled: bool) {
+        ui.add_enabled_ui(enabled, |ui| {
+            let mut picked = false;
+            ui.label("summary");
+            egui::ComboBox::from_id_salt("summary-model")
+                .selected_text(&self.summary_model)
+                .width(170.0)
+                .show_ui(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for m in SUMMARY_MODELS {
+                        let installed = self
+                            .models_dir
+                            .as_ref()
+                            .is_some_and(|dir| dir.join(m.file).exists());
+                        let icon = if installed { CHECK } else { DOWNLOAD_SIMPLE };
+                        let label =
+                            format!("{icon} {}  ({} · {})", m.name, m.size_label(), m.note);
+                        if ui
+                            .selectable_label(self.summary_model == m.name, label)
+                            .clicked()
+                        {
+                            self.summary_model = m.name.to_owned();
+                            picked = true;
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "which model writes the summary and the titles auto mode files \
+                     meetings under — the bigger ones keep the numbers and tradeoffs \
+                     a decision turned on, and 35b-a3b is faster than 9b despite its \
+                     size, because only ~3B of it runs per token",
+                );
+            if picked {
+                self.remember_summary_model();
+            }
+        });
+    }
+
     /// Keep the chosen summary model for the next run, like
     /// [`Self::remember_model`].
     fn remember_summary_model(&mut self) {
@@ -1666,9 +1710,10 @@ impl eframe::App for App {
                  they only apply to Whisper models",
                 self.model
             );
+            // Shared by both control rows below.
+            let model_enabled =
+                self.models_dir.is_some() && running.is_none() && self.download.is_none();
             ui.horizontal_wrapped(|ui| {
-                let model_enabled =
-                    self.models_dir.is_some() && running.is_none() && self.download.is_none();
                 let mut picked = false;
                 ui.add_enabled_ui(model_enabled, |ui| {
                     egui::ComboBox::from_id_salt("model")
@@ -1717,6 +1762,13 @@ impl eframe::App for App {
                              phantom extra speakers",
                         );
                 }
+            });
+            // A row of its own: the summary picker and the panels are
+            // about the app rather than about this one recording, and
+            // wrapping them in with the transcription controls left the
+            // speaker count clipped at narrow widths.
+            ui.horizontal_wrapped(|ui| {
+                self.summary_model_picker(ui, model_enabled);
                 if ui
                     .add_enabled(prompt_supported, egui::Button::new(format!("{BOOK_OPEN} Vocabulary…")))
                     .on_hover_text("terms Whisper should spell correctly — product names, people, acronyms")
@@ -2090,40 +2142,6 @@ impl eframe::App for App {
                     {
                         ui.ctx().copy_text(self.summary.clone());
                     }
-                    // Which model writes the minutes matters more than any
-                    // other setting here, so the picker sits next to them.
-                    ui.add_enabled_ui(!summarizing && self.download.is_none(), |ui| {
-                        let mut picked = false;
-                        egui::ComboBox::from_id_salt("summary-model")
-                            .selected_text(&self.summary_model)
-                            .show_ui(ui, |ui| {
-                                for m in SUMMARY_MODELS {
-                                    let installed = self
-                                        .models_dir
-                                        .as_ref()
-                                        .is_some_and(|dir| dir.join(m.file).exists());
-                                    let icon = if installed { CHECK } else { DOWNLOAD_SIMPLE };
-                                    let label =
-                                        format!("{icon} {}  ({} · {})", m.name, m.size_label(), m.note);
-                                    if ui
-                                        .selectable_label(self.summary_model == m.name, label)
-                                        .clicked()
-                                    {
-                                        self.summary_model = m.name.to_owned();
-                                        picked = true;
-                                    }
-                                }
-                            })
-                            .response
-                            .on_hover_text(
-                                "the bigger models keep the numbers and tradeoffs a \
-                                 decision turned on; 35b-a3b generates faster than 9b \
-                                 despite its size, because only ~3B of it runs per token",
-                            );
-                        if picked {
-                            self.remember_summary_model();
-                        }
-                    });
                 });
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical()
@@ -2735,6 +2753,8 @@ mod tests {
         harness.run();
         harness.snapshot("transcribe-gui-model-picker");
     }
+
+
 
     /// The model dropdown picks up where the last run left off — but a
     /// remembered name that no longer exists must not strand the app on a
