@@ -43,7 +43,13 @@ fn main() -> anyhow::Result<()> {
         language: "auto".into(),
         prompt: transcribe::DEFAULT_PROMPT.into(),
         context: String::new(),
-        summary_model: Some(models.join(transcribe::download::SUMMARY_MODEL_FILE)),
+        summary_model: Some(models.join(
+            transcribe::download::summary_model_by_name(
+                transcribe::download::DEFAULT_SUMMARY_MODEL,
+            )
+            .expect("the default summary model is in the list")
+            .file,
+        )),
         vocabulary: String::new(),
         dir: dir.clone(),
     };

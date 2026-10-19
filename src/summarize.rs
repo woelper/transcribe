@@ -1,5 +1,5 @@
-//! Local transcript summarization with a small llama.cpp chat model
-//! (Qwen3.5 4B, see [`crate::download::SUMMARY_MODEL_FILE`]).
+//! Local transcript summarization with a llama.cpp chat model
+//! (Qwen3.5, see [`crate::download::SUMMARY_MODELS`]).
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -19,16 +19,55 @@ use llama_cpp_2::token::LlamaToken;
 /// cache small at this size. Transcripts that tokenize past it are trimmed
 /// in the middle, keeping the start and the end.
 const N_CTX: u32 = 32768;
-/// Tokens reserved for the generated summary.
-const MAX_OUTPUT_TOKENS: usize = 1024;
+/// Tokens reserved for the generated summary. 1024 was not enough: the
+/// minutes for a 40-minute meeting run to ~1100 tokens on the larger
+/// models, and the cap cut them off mid-list.
+const MAX_OUTPUT_TOKENS: usize = 2048;
 /// Prompt tokens are fed to the model in chunks of this size.
 const N_BATCH: usize = 2048;
 
-const SYSTEM_PROMPT: &str = "You summarize meeting and speech transcripts. \
-    Answer in the language the transcript is written in. Structure the answer \
-    as: a short overview paragraph; key points as a bullet list; decisions and \
-    action items as bullet lists when the transcript contains any. Be concise \
-    and factual — never invent content that is not in the transcript.";
+/// Naming the sections and spelling out what belongs in each is worth
+/// more than it looks: asked only to "structure the answer", these
+/// models merge decisions into action items, drop tasks that were agreed
+/// in passing, and quietly round "nineteen a seat" up to "$19" — a
+/// currency the speakers never said. The transcript is speech, so the
+/// rules about mishearings and speaker labels earn their place too.
+const SYSTEM_PROMPT: &str = "You write the minutes of a recorded meeting or talk \
+    from its transcript.\n\
+    \n\
+    Rules:\n\
+    - Answer in the language the transcript is written in.\n\
+    - Use only what the transcript says. Never add a currency symbol, a date, a \
+    name or a number that is not there. If the transcript says \"nineteen a \
+    seat\", write \"19 a seat\", not \"$19 a seat\".\n\
+    - The transcript comes from speech recognition: speakers are labelled by \
+    name or as \"Speaker N\", words may be misheard, and people interrupt each \
+    other. Attribute each point to the speaker who made it, using the label the \
+    transcript uses.\n\
+    - Prefer the concrete over the general: name the thing, the number and the \
+    owner.\n\
+    \n\
+    Produce exactly these sections, in this order. Omit a section only if the \
+    transcript has nothing for it.\n\
+    \n\
+    ## Overview\n\
+    Two to four sentences: what this was and what came out of it.\n\
+    \n\
+    ## Discussion\n\
+    One bullet per topic, in the order discussed. Name the topic, the positions \
+    taken, and how it was left.\n\
+    \n\
+    ## Decisions\n\
+    One bullet per decision actually settled. Include the number or deadline \
+    that was agreed.\n\
+    \n\
+    ## Open questions\n\
+    One bullet per thing raised and left unresolved.\n\
+    \n\
+    ## Action items\n\
+    One bullet per task, written as \"Owner - what, by when\". Use \"unassigned\" \
+    when nobody took it. List every task, including ones mentioned only in \
+    passing.";
 
 const TRUNCATION_MARKER: &str = "\n[... middle of the transcript omitted ...]\n";
 

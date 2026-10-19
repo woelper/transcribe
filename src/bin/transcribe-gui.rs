@@ -13,7 +13,7 @@ use egui_phosphor::fill::{
 use transcribe::auto;
 use transcribe::diarize::SpeakerProfile;
 use transcribe::download::{
-    DIARIZATION_MODELS, SUMMARY_MODEL_FILE, SUMMARY_MODEL_SIZE, SUMMARY_MODEL_URL, VAD_MODEL_FILE,
+    DEFAULT_SUMMARY_MODEL, DIARIZATION_MODELS, SUMMARY_MODELS, VAD_MODEL_FILE, summary_model_by_name,
     VAD_MODEL_URL, SPEECH_MODELS, model_by_name,
 };
 use transcribe::recorder::{self, Recorder};
@@ -444,6 +444,8 @@ struct App {
     /// topics) — folded into the whisper prompt for this transcription only.
     context: String,
     model: String,
+    /// Chat model the Summarize button runs, by name in [`SUMMARY_MODELS`].
+    summary_model: String,
     download: Option<Arc<Mutex<Download>>>,
     show_speakers: bool,
     /// How many people are in the recording (None = automatic, up to 8).
@@ -537,6 +539,7 @@ impl App {
         let settings_path = settings::settings_path();
         let settings = settings::load(&settings_path);
         let model = remembered_model(&settings);
+        let summary_model = remembered_summary_model(&settings);
         log::info!("models dir {models_dir:?}; {} enrolled speaker(s)", profiles.len());
         let status = match &models_dir {
             None => "error: models/ directory not found — run the download \
@@ -562,6 +565,7 @@ impl App {
             show_vocabulary: false,
             context: String::new(),
             model,
+            summary_model,
             download: None,
             show_speakers: false,
             max_speakers: None,
@@ -692,6 +696,18 @@ impl App {
         }
     }
 
+    /// Keep the chosen summary model for the next run, like
+    /// [`Self::remember_model`].
+    fn remember_summary_model(&mut self) {
+        if self.settings.summary_model.as_deref() == Some(self.summary_model.as_str()) {
+            return;
+        }
+        self.settings.summary_model = Some(self.summary_model.clone());
+        if let Err(e) = settings::save(&self.settings_path, &self.settings) {
+            log::error!("could not save settings: {e:#}");
+        }
+    }
+
     fn model_path(&self) -> Option<PathBuf> {
         let model = model_by_name(&self.model)?;
         self.models_dir.as_ref().map(|dir| dir.join(model.file))
@@ -797,18 +813,20 @@ impl App {
     }
 
     fn summary_model_path(&self) -> Option<PathBuf> {
-        self.models_dir.as_ref().map(|dir| dir.join(SUMMARY_MODEL_FILE))
+        let model = summary_model_by_name(&self.summary_model)?;
+        self.models_dir.as_ref().map(|dir| dir.join(model.file))
     }
 
     /// Summarize the transcript with the local chat model, fetching the
     /// model first if it isn't on disk yet.
     fn start_summarization(&mut self) {
         let Some(path) = self.summary_model_path() else { return };
+        let Some(model) = summary_model_by_name(&self.summary_model) else { return };
         if !path.exists() {
             self.summarize_pending = true;
             self.start_file_download(
-                "summary model".into(),
-                SUMMARY_MODEL_URL.to_owned(),
+                format!("summary model {}", model.name),
+                model.url.to_owned(),
                 path,
             );
             return;
@@ -1815,13 +1833,16 @@ impl eframe::App for App {
                         && self.summary_job.is_none()
                         && self.download.is_none()
                         && self.models_dir.is_some();
+                    let size = summary_model_by_name(&self.summary_model)
+                        .map_or_else(String::new, |m| m.size_label());
                     let summarize_hover = if summary_model_missing {
                         format!(
-                            "summarize the transcript with a local language model — \
-                             first use downloads it ({SUMMARY_MODEL_SIZE})"
+                            "summarize the transcript with {} — first use \
+                             downloads it ({size})",
+                            self.summary_model,
                         )
                     } else {
-                        "summarize the transcript with the local language model".into()
+                        format!("summarize the transcript with {}", self.summary_model)
                     };
                     if ui
                         .add_enabled(
@@ -2069,6 +2090,40 @@ impl eframe::App for App {
                     {
                         ui.ctx().copy_text(self.summary.clone());
                     }
+                    // Which model writes the minutes matters more than any
+                    // other setting here, so the picker sits next to them.
+                    ui.add_enabled_ui(!summarizing && self.download.is_none(), |ui| {
+                        let mut picked = false;
+                        egui::ComboBox::from_id_salt("summary-model")
+                            .selected_text(&self.summary_model)
+                            .show_ui(ui, |ui| {
+                                for m in SUMMARY_MODELS {
+                                    let installed = self
+                                        .models_dir
+                                        .as_ref()
+                                        .is_some_and(|dir| dir.join(m.file).exists());
+                                    let icon = if installed { CHECK } else { DOWNLOAD_SIMPLE };
+                                    let label =
+                                        format!("{icon} {}  ({} · {})", m.name, m.size_label(), m.note);
+                                    if ui
+                                        .selectable_label(self.summary_model == m.name, label)
+                                        .clicked()
+                                    {
+                                        self.summary_model = m.name.to_owned();
+                                        picked = true;
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "the bigger models keep the numbers and tradeoffs a \
+                                 decision turned on; 35b-a3b generates faster than 9b \
+                                 despite its size, because only ~3B of it runs per token",
+                            );
+                        if picked {
+                            self.remember_summary_model();
+                        }
+                    });
                 });
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical()
@@ -2290,6 +2345,18 @@ fn remembered_model(settings: &settings::Settings) -> String {
             DEFAULT_MODEL.to_owned()
         }
         None => DEFAULT_MODEL.to_owned(),
+    }
+}
+
+/// Same as [`remembered_model`], for the summary model.
+fn remembered_summary_model(settings: &settings::Settings) -> String {
+    match settings.summary_model.as_deref() {
+        Some(name) if summary_model_by_name(name).is_some() => name.to_owned(),
+        Some(name) => {
+            log::warn!("remembered summary model {name:?} is not offered any more; using the default");
+            DEFAULT_SUMMARY_MODEL.to_owned()
+        }
+        None => DEFAULT_SUMMARY_MODEL.to_owned(),
     }
 }
 
@@ -2677,7 +2744,10 @@ mod tests {
         use transcribe::settings::Settings;
 
         let remembered = |model: Option<&str>| {
-            super::remembered_model(&Settings { model: model.map(str::to_owned) })
+            super::remembered_model(&Settings {
+                model: model.map(str::to_owned),
+                ..Settings::default()
+            })
         };
         assert_eq!(remembered(None), super::DEFAULT_MODEL, "first run");
         assert_eq!(remembered(Some("parakeet-ultra")), "parakeet-ultra");
@@ -2687,6 +2757,27 @@ mod tests {
         assert_eq!(remembered(Some("parakeet-tdt-0.6b-v3")), super::DEFAULT_MODEL);
         assert_eq!(remembered(Some("ggml-whisper-from-2023")), super::DEFAULT_MODEL);
         assert_eq!(remembered(Some("")), super::DEFAULT_MODEL);
+    }
+
+    /// Same for the summary model: the three sizes are a user's choice to
+    /// keep, and a name from another build must not strand them on a
+    /// model that isn't offered.
+    #[test]
+    fn the_last_picked_summary_model_is_restored() {
+        use transcribe::settings::Settings;
+
+        let remembered = |model: Option<&str>| {
+            super::remembered_summary_model(&Settings {
+                summary_model: model.map(str::to_owned),
+                ..Settings::default()
+            })
+        };
+        assert_eq!(remembered(None), super::DEFAULT_SUMMARY_MODEL, "first run");
+        assert_eq!(remembered(Some("qwen3.5-35b-a3b")), "qwen3.5-35b-a3b");
+        assert_eq!(remembered(Some("qwen3.5-9b")), "qwen3.5-9b");
+        // What the single hard-coded model was called before this list.
+        assert_eq!(remembered(Some("Qwen3.5-4B-Q4_K_M.gguf")), super::DEFAULT_SUMMARY_MODEL);
+        assert_eq!(remembered(Some("")), super::DEFAULT_SUMMARY_MODEL);
     }
 
     #[test]

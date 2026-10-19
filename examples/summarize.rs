@@ -1,11 +1,17 @@
 //! Summarize a transcript from the command line (the GUI has this built in):
 //!   cargo run --release --example summarize -- transcript.txt [model.gguf]
-//! Without a model argument, uses the summary model from the models/
-//! directory. With `--label`, prints the title and one-line summary auto
-//! mode names a meeting with instead of the long summary.
+//! Without a model argument, uses the default summary model from the
+//! models/ directory. With `--label`, prints the title and one-line
+//! summary auto mode names a meeting with instead of the long summary.
 
 use std::io::Write;
 use std::path::PathBuf;
+
+use transcribe::download::{DEFAULT_SUMMARY_MODEL, SummaryModel, summary_model_by_name};
+
+fn default_summary_model() -> &'static SummaryModel {
+    summary_model_by_name(DEFAULT_SUMMARY_MODEL).expect("the default summary model is in the list")
+}
 
 fn main() -> anyhow::Result<()> {
     transcribe::applog::init();
@@ -19,7 +25,7 @@ fn main() -> anyhow::Result<()> {
         Some(path) => PathBuf::from(path),
         None => transcribe::find_models_dir()
             .expect("models/ directory not found")
-            .join(transcribe::download::SUMMARY_MODEL_FILE),
+            .join(default_summary_model().file),
     };
 
     let transcript = std::fs::read_to_string(text)?;

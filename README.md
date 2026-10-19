@@ -53,9 +53,17 @@ app ever closes on its own, that file says why.
 - **Speakers…** enrolls voices so future transcripts label them by name;
   **Rename…** relabels `Speaker 1` in a finished transcript and enrolls that
   voice in one step (see below).
-- **Summarize** condenses the transcript with a local language model,
-  Qwen3.5 4B, using the context notes and vocabulary too (downloaded
-  on first use).
+- **Summarize** writes the minutes — overview, discussion, decisions, open
+  questions, action items — with a local language model, using the context
+  notes and vocabulary too (downloaded on first use). The picker in the
+  Summary window offers four sizes of Qwen3.5, so the app stays usable on
+  an old laptop and gets good on a big machine: **2b** (1.2 GB, the floor —
+  gets the shape right, misattributes some action items), **4b** (2.6 GB,
+  the default), **9b** (5.4 GB), and **35b-a3b** (15.8 GB, the best by a
+  wide margin). The last is a mixture of experts — 35B parameters but only
+  ~3B of them run per token — so on a CPU it generates *faster* than the
+  dense 9b while keeping the numbers and tradeoffs a decision turned on.
+  Give it ~18 GB of RAM.
 - The transcript is editable in place; **Save transcript…** writes it via a
   file dialog.
 
@@ -91,8 +99,8 @@ Good morning everyone, thanks for joining the quarterly planning call.
 ...
 ```
 
-The title and the summary line come from the same local model the
-**Summarize** button uses (Qwen3.5 4B). Without it downloaded, meetings are
+The title and the summary line come from whichever local model the
+**Summarize** button is set to. Without it downloaded, meetings are
 still recorded and filed — just under their date alone. **History…** lists
 everything filed, newest first, and opens any of them back into the editor.
 

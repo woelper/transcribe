@@ -19,6 +19,8 @@ pub struct Settings {
     /// Speech model last picked in the model dropdown, by name. None on a
     /// first run; a name no longer offered falls back to the default.
     pub model: Option<String>,
+    /// Summary model last picked, by name, with the same fallback.
+    pub summary_model: Option<String>,
 }
 
 /// Locate the settings file the same way as [`crate::speakers_path`].
@@ -80,7 +82,10 @@ mod tests {
         let path = dir.join(SETTINGS_FILE);
         assert_eq!(load(&path), Settings::default(), "a missing file is defaults");
 
-        let settings = Settings { model: Some("parakeet-tdt-0.6b-v3".into()) };
+        let settings = Settings {
+            model: Some("parakeet-tdt-0.6b-v3".into()),
+            summary_model: Some("qwen3.5-35b-a3b".into()),
+        };
         save(&path, &settings).unwrap();
         assert_eq!(load(&path), settings);
         let _ = std::fs::remove_dir_all(&dir);

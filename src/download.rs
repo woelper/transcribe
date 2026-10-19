@@ -92,14 +92,19 @@ pub const SPEECH_MODELS: &[SpeechModel] = &[
     },
 ];
 
+/// "705 MB" / "1.6 GB", for a size in MiB.
+fn size_label(mb: u32) -> String {
+    if mb >= 1000 {
+        format!("{:.1} GB", mb as f32 / 1000.0)
+    } else {
+        format!("{mb} MB")
+    }
+}
+
 impl SpeechModel {
     /// "705 MB" / "1.6 GB".
     pub fn size_label(&self) -> String {
-        if self.mb >= 1000 {
-            format!("{:.1} GB", self.mb as f32 / 1000.0)
-        } else {
-            format!("{} MB", self.mb)
-        }
+        size_label(self.mb)
     }
 }
 
@@ -113,15 +118,90 @@ pub struct DiarizationModel {
     pub url: &'static str,
 }
 
-/// Chat model used by the Summarize button: Qwen3.5 4B Instruct (March
-/// 2026, Apache 2.0), Q4_K_M-quantized. Small enough to run on CPU at
-/// usable speed, strongly multilingual, and with a context window large
-/// enough to take a whole meeting transcript. Its optional thinking mode
-/// is off by default for this size; any `<think>` block is stripped anyway.
-pub const SUMMARY_MODEL_FILE: &str = "Qwen3.5-4B-Q4_K_M.gguf";
-pub const SUMMARY_MODEL_URL: &str =
-    "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf";
-pub const SUMMARY_MODEL_SIZE: &str = "2.6 GB";
+pub struct SummaryModel {
+    pub name: &'static str,
+    /// Download size in MiB (also a fair proxy for RAM use).
+    pub mb: u32,
+    /// Caveat shown in the model picker, e.g. how much RAM it wants.
+    pub note: &'static str,
+    /// Local filename under models/.
+    pub file: &'static str,
+    pub url: &'static str,
+}
+
+/// Chat models for the Summarize button and the titles auto mode gives a
+/// finished meeting, smallest first. All of them are Qwen3.5 (March 2026,
+/// Apache 2.0), which is multilingual over 201 languages and takes a
+/// whole meeting transcript in one window. Their optional thinking mode
+/// stays off: at these sizes the model spends the entire token budget
+/// thinking and never reaches an answer (measured on the 4B — 6144
+/// tokens of reasoning, no summary), and any `<think>` block is
+/// stripped anyway.
+///
+/// The ladder spans a factor of thirteen in download and memory on
+/// purpose, because the machines that run this app do too. `2b` is the
+/// floor for old and small hardware — 1.2 GB down, ~2.3 GB resident,
+/// a minute for a 40-minute meeting. It gets the shape of a meeting and
+/// the agreed numbers right, but misattributes some action items, so it
+/// is a fallback rather than a recommendation.
+///
+/// Nothing below 2B belongs here: Qwen3.5-0.8B was tried and collapsed
+/// into a repetition loop on the same transcript — 91 copies of one
+/// action item until it hit the output-token cap.
+/// Anything that small would need a presence penalty in the sampler
+/// before it could be offered at all.
+///
+/// `35b-a3b` is a sparse mixture of experts: 35B total but only ~3B
+/// active per token, so on a CPU it *generates faster* than the dense 9B
+/// while writing a far better summary — it keeps the tradeoffs and the
+/// numbers a decision turned on, which every smaller one drops. It is
+/// the one to pick when the machine has the RAM; the 4B stays the
+/// default only because it is a sixth of the download.
+pub const SUMMARY_MODELS: &[SummaryModel] = &[
+    SummaryModel {
+        name: "qwen3.5-2b",
+        mb: 1221,
+        note: "small, keeps the shape",
+        file: "Qwen3.5-2B-Q4_K_M.gguf",
+        url: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf",
+    },
+    SummaryModel {
+        name: "qwen3.5-4b",
+        mb: 2613,
+        note: "fastest, drops detail",
+        file: "Qwen3.5-4B-Q4_K_M.gguf",
+        url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
+    },
+    SummaryModel {
+        name: "qwen3.5-9b",
+        mb: 5417,
+        note: "needs ~10 GB RAM",
+        file: "Qwen3.5-9B-Q4_K_M.gguf",
+        url: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
+    },
+    SummaryModel {
+        name: "qwen3.5-35b-a3b",
+        mb: 15831,
+        note: "best, needs ~18 GB RAM",
+        file: "Qwen3.5-35B-A3B-UD-Q3_K_XL.gguf",
+        url: "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/Qwen3.5-35B-A3B-UD-Q3_K_XL.gguf",
+    },
+];
+
+/// What a fresh install summarizes with: the smallest download that
+/// works, not the best summary. See [`SUMMARY_MODELS`].
+pub const DEFAULT_SUMMARY_MODEL: &str = "qwen3.5-4b";
+
+impl SummaryModel {
+    /// "705 MB" / "1.6 GB".
+    pub fn size_label(&self) -> String {
+        size_label(self.mb)
+    }
+}
+
+pub fn summary_model_by_name(name: &str) -> Option<&'static SummaryModel> {
+    SUMMARY_MODELS.iter().find(|m| m.name == name)
+}
 
 /// whisper.cpp's built-in voice activity detection model (Silero v5.1.2,
 /// under 1 MB). With it, whisper only decodes stretches that contain
