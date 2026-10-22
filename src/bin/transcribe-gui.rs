@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"] // no console window behind the app on Windows
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -99,6 +100,47 @@ fn card() -> egui::Frame {
 
 /// Corner radius shared by buttons, fields, and progress bars.
 const WIDGET_RADIUS: u8 = 12;
+
+/// How many input-level samples the meter keeps. The UI repaints every
+/// 100 ms while the mic is open, so this is about two seconds.
+const LEVEL_HISTORY: usize = 20;
+
+/// A rolling bar chart of recent input level, in place of a single bar.
+/// One bar says whether sound is arriving *now*, which flickers through
+/// the gaps between words; a couple of seconds of history shows at a
+/// glance that the mic is live, roughly how loud, and whether anything
+/// has been said lately.
+///
+/// Drawn with the painter rather than a plotting crate: it is a dozen
+/// rectangles, and `model_row` already draws its rating bars this way.
+fn level_meter(ui: &mut egui::Ui, history: &VecDeque<f32>, fill: egui::Color32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(80.0, 20.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, WIDGET_RADIUS as f32, TRACK_OFF);
+    let gap = 1.0;
+    let width = (rect.width() - gap * (LEVEL_HISTORY - 1) as f32) / LEVEL_HISTORY as f32;
+    let inset = 2.0;
+    let tallest = rect.height() - inset * 2.0;
+    // Newest on the right, so a partly filled history grows leftwards
+    // instead of jumping when it finally wraps.
+    let count = history.len();
+    for (i, &level) in history.iter().enumerate() {
+        let from_right = (count - i) as f32;
+        let x = rect.right() - inset - from_right * width - (from_right - 1.0) * gap;
+        if x < rect.left() + inset {
+            continue;
+        }
+        // The same 4x scaling the single-bar meter used, and at least a
+        // sliver so silence reads as "capturing, quiet" not "dead".
+        let height = ((level * 4.0).clamp(0.0, 1.0) * tallest).max(1.0);
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(x, rect.bottom() - inset - height),
+            egui::vec2(width, height),
+        );
+        painter.rect_filled(bar, 1.0, fill);
+    }
+    response
+}
 
 /// Progress bar with the same rounding as the buttons (egui's default is
 /// a pill).
@@ -248,8 +290,10 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
 
 /// IBM Plex typography over the reference palette, with roomy rounded
 /// borderless widgets and soft shadows.
-fn setup_theme(ctx: &egui::Context) {
-    use egui::{CornerRadius, FontFamily, FontId, Shadow, Stroke, TextStyle, vec2};
+/// The app's fonts: IBM Plex for text, Phosphor for icons, in every
+/// family that renders either.
+fn font_definitions() -> egui::FontDefinitions {
+    use egui::FontFamily;
 
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
@@ -282,14 +326,20 @@ fn setup_theme(ctx: &egui::Context) {
         vec!["plex-sans-medium".into(), "plex-sans".into()],
     );
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Fill);
-    // add_to_fonts only extends the built-in families; the medium family
-    // (filled buttons) needs the icon font too or "{STOP} Stop" shows "?".
+    // add_to_fonts (0.13) extends Proportional and nothing else, so every
+    // other family needs the icon font appended by hand or its icons come
+    // out as tofu squares: the medium family for "{STOP} Stop" on filled
+    // buttons, and Monospace for "{MICROPHONE} recording 00:12".
+    for family in [FontFamily::Name("plex-medium".into()), FontFamily::Monospace] {
+        fonts.families.get_mut(&family).unwrap().push("phosphor".into());
+    }
     fonts
-        .families
-        .get_mut(&FontFamily::Name("plex-medium".into()))
-        .unwrap()
-        .push("phosphor".into());
-    ctx.set_fonts(fonts);
+}
+
+fn setup_theme(ctx: &egui::Context) {
+    use egui::{CornerRadius, FontFamily, FontId, Shadow, Stroke, TextStyle, vec2};
+
+    ctx.set_fonts(font_definitions());
 
     ctx.set_theme(egui::ThemePreference::Light);
     let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
@@ -393,7 +443,10 @@ impl Source {
     fn label(&self) -> String {
         match self {
             Source::File(path) => path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-            Source::Recording { secs, .. } => format!("recording ({})", format_mmss(*secs)),
+            // Past tense: this is the finished take sitting in memory. The
+            // live counter while the mic is open says "recording" instead,
+            // and the two were indistinguishable.
+            Source::Recording { secs, .. } => format!("recorded ({})", format_mmss(*secs)),
         }
     }
 }
@@ -444,6 +497,8 @@ struct App {
     /// topics) — folded into the whisper prompt for this transcription only.
     context: String,
     model: String,
+    /// Recent input levels, newest last — see [`level_meter`].
+    level_history: VecDeque<f32>,
     /// Chat model the Summarize button runs, by name in [`SUMMARY_MODELS`].
     summary_model: String,
     download: Option<Arc<Mutex<Download>>>,
@@ -565,6 +620,7 @@ impl App {
             show_vocabulary: false,
             context: String::new(),
             model,
+            level_history: VecDeque::new(),
             summary_model,
             download: None,
             show_speakers: false,
@@ -1558,6 +1614,20 @@ impl eframe::App for App {
         {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
+        // One sample per frame, paced by the repaint above. Auto mode and
+        // manual recording never hold the input at the same time, so one
+        // buffer serves both; whoever has it clears it when they let go.
+        let live_recorder =
+            if self.auto.on { self.auto.recorder.as_ref() } else { self.recorder.as_ref() };
+        match live_recorder {
+            Some(recorder) => {
+                if self.level_history.len() == LEVEL_HISTORY {
+                    self.level_history.pop_front();
+                }
+                self.level_history.push_back(recorder.level());
+            }
+            None => self.level_history.clear(),
+        }
         let recording = self.recorder.is_some();
         // Auto mode owns the input and the transcript view while it runs,
         // so everything manual waits for it.
@@ -1662,19 +1732,22 @@ impl eframe::App for App {
                     // is obvious at a glance. What is "loaded" means
                     // nothing here — the status bar says what it is doing.
                     _ if self.auto.on => {
-                        if let Some(recorder) = &self.auto.recorder {
+                        if self.auto.recorder.is_some() {
                             let voiced = self
                                 .auto
                                 .status
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .voiced;
-                            ui.add(
-                                progress_bar((recorder.level() * 4.0).min(1.0))
-                                    .desired_width(80.0)
-                                    .fill(if voiced { RED } else { GREEN }),
+                            level_meter(
+                                ui,
+                                &self.level_history,
+                                if voiced { RED } else { GREEN },
                             )
-                            .on_hover_text("input level — red while someone is talking");
+                            .on_hover_text(
+                                "input level, last couple of seconds — red while \
+                                 someone is talking",
+                            );
                         }
                     }
                     (_, Some(recorder)) => {
@@ -1689,12 +1762,8 @@ impl eframe::App for App {
                         // Live input level, so a dead source (muted mic, missing
                         // permission, unrouted loopback) is visible immediately.
                         let level = recorder.level();
-                        ui.add(
-                            progress_bar((level * 4.0).min(1.0))
-                                .desired_width(80.0)
-                                .fill(GREEN),
-                        )
-                        .on_hover_text("input level");
+                        level_meter(ui, &self.level_history, GREEN)
+                            .on_hover_text("input level, last couple of seconds");
                         if level == 0.0 && recorder.duration_secs() > 2.0 {
                             ui.colored_label(ui.visuals().warn_fg_color, format!("{WARNING} no signal!"));
                         }
@@ -2784,6 +2853,67 @@ mod tests {
     }
 
 
+
+    /// What the mic row actually looks like: the monospace counter with
+    /// its icon, and the level meter over a synthetic couple of seconds.
+    /// Neither can be reached from `App` in a test — a live `Recorder`
+    /// needs a real audio device — so they are rendered directly.
+    #[test]
+    #[ignore = "needs a GPU; run with --ignored to check/update the UI snapshot"]
+    fn ui_screenshot_level_meter() {
+        use std::collections::VecDeque;
+
+        let history: VecDeque<f32> = (0..super::LEVEL_HISTORY)
+            .map(|i| {
+                // A couple of words with a gap between them.
+                let t = i as f32 / super::LEVEL_HISTORY as f32;
+                (((t * 9.0).sin().abs() * 0.22) + 0.01) * if (7..11).contains(&i) { 0.1 } else { 1.0 }
+            })
+            .collect();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(320.0, 80.0))
+            .with_theme(egui::Theme::Light)
+            .build_ui(move |ui| {
+                super::setup_theme(ui.ctx());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} recording 00:12", super::MICROPHONE))
+                            .monospace()
+                            .color(super::RED),
+                    );
+                    super::level_meter(ui, &history, super::GREEN);
+                });
+            });
+        harness.run();
+        harness.snapshot("transcribe-gui-level-meter");
+    }
+
+    /// Every family that renders an icon must carry the icon font.
+    /// egui-phosphor's `add_to_fonts` adds it to `Proportional` and
+    /// nothing else, so each other family is appended by hand — and when
+    /// one was missed the icon came out as a tofu square: first on the
+    /// filled buttons ("{STOP} Stop"), then on the monospace recording
+    /// counter ("{MICROPHONE} recording 00:12"). An upgrade that changes
+    /// what `add_to_fonts` touches should fail here, not on screen.
+    #[test]
+    fn every_icon_family_has_the_icon_font() {
+        use egui::FontFamily;
+
+        let fonts = super::font_definitions();
+        for family in [
+            FontFamily::Proportional,
+            FontFamily::Monospace,
+            FontFamily::Name("plex-medium".into()),
+        ] {
+            let keys = fonts.families.get(&family).unwrap_or_else(|| {
+                panic!("font family {family:?} is not defined");
+            });
+            assert!(
+                keys.iter().any(|k| k == "phosphor"),
+                "font family {family:?} cannot render icons: {keys:?}"
+            );
+        }
+    }
 
     /// The model dropdown picks up where the last run left off — but a
     /// remembered name that no longer exists must not strand the app on a
