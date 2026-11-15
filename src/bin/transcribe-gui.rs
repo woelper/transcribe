@@ -499,6 +499,9 @@ struct App {
     model: String,
     /// Recent input levels, newest last — see [`level_meter`].
     level_history: VecDeque<f32>,
+    /// Whether the window was minimized or covered last frame, so the
+    /// change is logged once rather than every frame.
+    hidden: bool,
     /// Chat model the Summarize button runs, by name in [`SUMMARY_MODELS`].
     summary_model: String,
     download: Option<Arc<Mutex<Download>>>,
@@ -621,6 +624,7 @@ impl App {
             context: String::new(),
             model,
             level_history: VecDeque::new(),
+            hidden: false,
             summary_model,
             download: None,
             show_speakers: false,
@@ -1603,18 +1607,15 @@ impl eframe::App for App {
             self.recorder = None;
             self.status = format!("error: recording failed: {error}");
         }
-        if running.is_some()
+        let working = running.is_some()
             || finishing.is_some()
             || downloading.is_some()
             || enrolling
             || summarizing
             || listening.is_some()
             || self.recorder.is_some()
-            || self.enroll_recorder.is_some()
-        {
-            ui.ctx().request_repaint_after(Duration::from_millis(100));
-        }
-        // One sample per frame, paced by the repaint above. Auto mode and
+            || self.enroll_recorder.is_some();
+        // One sample per frame, paced by the repaint below. Auto mode and
         // manual recording never hold the input at the same time, so one
         // buffer serves both; whoever has it clears it when they let go.
         let live_recorder =
@@ -1627,6 +1628,38 @@ impl eframe::App for App {
                 self.level_history.push_back(recorder.level());
             }
             None => self.level_history.clear(),
+        }
+
+        // Minimized or fully covered, nobody can see any of this, and
+        // drawing it is what keeps the frame loop hot: every `Spinner` on
+        // screen calls `request_repaint()` with no delay ("because it is
+        // animated"), and the app shows one whenever it is transcribing,
+        // summarizing, downloading or listening. A visible window's vsync
+        // caps that at the refresh rate. A minimized one has no frame
+        // callbacks to block on, so the render thread free-runs and burns
+        // a core behind the user's back, on top of whatever the worker
+        // threads are already doing. Keep polling so background work
+        // still chains, and leave the drawing until someone looks.
+        let hidden = ui.ctx().input(|i| {
+            let viewport = i.viewport();
+            viewport.minimized == Some(true) || viewport.occluded == Some(true)
+        });
+        if hidden != self.hidden {
+            self.hidden = hidden;
+            log::info!(
+                "window {}; {} the ui",
+                if hidden { "hidden" } else { "visible" },
+                if hidden { "pausing" } else { "resuming" },
+            );
+        }
+        if hidden {
+            if working {
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            }
+            return;
+        }
+        if working {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         let recording = self.recorder.is_some();
         // Auto mode owns the input and the transcript view while it runs,
